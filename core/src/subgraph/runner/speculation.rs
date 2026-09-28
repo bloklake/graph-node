@@ -1,10 +1,9 @@
 //! Speculative trigger execution.
 //!
-//! Blocks the runner has read ahead from the block stream have their triggers matched and run on
-//! the speculation threads (`GRAPH_SPECULATION_THREADS`) while the runner works through earlier
-//! blocks. Each speculative run starts from a fresh block state over the store as it was when the
-//! run was launched (the snapshot) and records what the handler read and, in order, what it
-//! wrote.
+//! Blocks the runner has read ahead from the block stream have their triggers matched and run as
+//! speculative tasks (`GRAPH_SPECULATION_THREADS`) while the runner works through earlier blocks.
+//! Each speculative run starts from a fresh block state over the store as it was when the run was
+//! launched (the snapshot) and records what the handler read and, in order, what it wrote.
 //!
 //! When the runner reaches the trigger, it uses the run only if nothing the handler read changed
 //! after the snapshot: no later block and no earlier trigger of the same block wrote a key it
@@ -34,13 +33,36 @@ pub(super) const MAX_PENDING: usize = 16_384;
 /// could fail on capacity where the speculative run, starting fresh, did not).
 const MIN_WRITE_CAPACITY: usize = 256 * 1024 * 1024;
 
-/// A trigger's speculative run: the block, the trigger's position in it, and the host.
-pub(super) type Key = (BlockHash, usize, usize);
+/// A run within a block: the trigger's position in the block and the host.
+pub(super) type RunKey = (usize, usize);
+pub(super) type RunResult = Result<SpeculativeRun, MappingError>;
 
-pub(super) struct Pending {
-    /// Last block the store had when the run was launched.
+/// Identifies a host by its address; hosts live behind `Arc`s for the runner's lifetime.
+pub(super) fn host_id<H: ?Sized>(host: &H) -> usize {
+    (host as *const H).cast::<()>() as usize
+}
+
+/// The runs of one read-ahead block, delivered together when all have finished.
+struct BlockRuns {
+    /// Last block the store had when the runs were launched.
     snapshot: BlockNumber,
-    result: oneshot::Receiver<Result<SpeculativeRun, MappingError>>,
+    count: usize,
+    runs: oneshot::Receiver<Vec<(RunKey, RunResult)>>,
+}
+
+/// A block's finished runs, taken by the runner when it processes the block.
+pub(super) struct ReadyRuns {
+    snapshot: BlockNumber,
+    runs: HashMap<RunKey, RunResult>,
+}
+
+/// Which hosts each trigger of a read-ahead block was matched to when its runs were launched.
+pub(super) struct LaunchedBlock {
+    /// `SubgraphInstance::hosts_generation` at launch; while it is unchanged, matching the
+    /// block's triggers again would give the same hosts.
+    pub generation: u64,
+    /// Per trigger, its candidate hosts, in order; every one has a run.
+    pub hosts: Vec<Vec<usize>>,
 }
 
 /// How often a handler's speculative runs could be used. Handlers whose runs mostly read
@@ -58,15 +80,6 @@ const STATS_MIN_TRIED: u32 = 64;
 const STATS_MIN_USED_RATIO: f64 = 0.5;
 /// ...except every this many triggers, to notice when that changes.
 const STATS_PROBE_EVERY: u32 = 256;
-
-/// Which hosts each trigger of a read-ahead block was matched to when its runs were launched.
-pub(super) struct LaunchedBlock {
-    /// `SubgraphInstance::hosts_generation` at launch; while it is unchanged, matching the
-    /// block's triggers again would give the same hosts.
-    pub generation: u64,
-    /// Per trigger, the hosts it matched, in order; every one has a pending run.
-    pub hosts: Vec<Vec<usize>>,
-}
 
 /// Per-handler success counts, shared with the speculative tasks that consult them.
 #[derive(Default)]
@@ -118,8 +131,10 @@ impl Stats {
 
 #[derive(Default)]
 struct Inner {
-    pending: HashMap<Key, Pending>,
-    blocks: HashMap<BlockHash, LaunchedBlock>,
+    blocks: HashMap<BlockHash, BlockRuns>,
+    launched: HashMap<BlockHash, LaunchedBlock>,
+    /// Runs of all `blocks`.
+    pending_runs: usize,
     /// The last block in which each entity (type) was written, for blocks the runner processed
     /// while speculative runs may have been reading older state.
     written: HashMap<EntityKey, BlockNumber>,
@@ -132,48 +147,62 @@ pub(super) struct Speculations {
     pub(super) stats: std::sync::Arc<Stats>,
 }
 
-/// Identifies a host by its address; hosts live behind `Arc`s for the runner's lifetime.
-pub(super) fn host_id<H: ?Sized>(host: &H) -> usize {
-    (host as *const H).cast::<()>() as usize
-}
-
 impl Speculations {
     pub(super) fn pending_len(&self) -> usize {
-        self.inner.lock().unwrap().pending.len()
+        self.inner.lock().unwrap().pending_runs
     }
 
-    pub(super) fn insert(
+    /// Registers the `count` runs launched for block `hash`.
+    pub(super) fn insert_block(
         &self,
-        key: Key,
+        hash: BlockHash,
         snapshot: BlockNumber,
-        result: oneshot::Receiver<Result<SpeculativeRun, MappingError>>,
+        count: usize,
+        runs: oneshot::Receiver<Vec<(RunKey, RunResult)>>,
     ) {
-        self.inner
-            .lock()
-            .unwrap()
-            .pending
-            .insert(key, Pending { snapshot, result });
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_runs += count;
+        if let Some(old) = inner.blocks.insert(
+            hash,
+            BlockRuns {
+                snapshot,
+                count,
+                runs,
+            },
+        ) {
+            inner.pending_runs -= old.count;
+        }
     }
 
     pub(super) fn launched(&self, hash: BlockHash, block: LaunchedBlock) {
-        self.inner.lock().unwrap().blocks.insert(hash, block);
+        self.inner.lock().unwrap().launched.insert(hash, block);
     }
 
     pub(super) fn take_launched(&self, hash: &BlockHash) -> Option<LaunchedBlock> {
-        self.inner.lock().unwrap().blocks.remove(hash)
+        self.inner.lock().unwrap().launched.remove(hash)
     }
 
-    /// Takes the runs of all `keys`, or none of them when any is missing.
-    pub(super) fn take_all(&self, keys: impl Iterator<Item = Key>) -> Option<Vec<Pending>> {
-        let mut inner = self.inner.lock().unwrap();
-        keys.map(|key| inner.pending.remove(&key)).collect()
+    /// Takes block `hash`'s runs, waiting for them to finish.
+    pub(super) async fn take_block(&self, hash: &BlockHash) -> Option<ReadyRuns> {
+        let block = {
+            let mut inner = self.inner.lock().unwrap();
+            let block = inner.blocks.remove(hash)?;
+            inner.pending_runs -= block.count;
+            block
+        };
+        let runs = block.runs.await.ok()?;
+        Some(ReadyRuns {
+            snapshot: block.snapshot,
+            runs: runs.into_iter().collect(),
+        })
     }
 
     /// Drops every pending run (reverts and restarts).
     pub(super) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.pending.clear();
         inner.blocks.clear();
+        inner.launched.clear();
+        inner.pending_runs = 0;
         inner.written.clear();
         inner.written_types.clear();
     }
@@ -181,7 +210,7 @@ impl Speculations {
     /// Notes what a processed block wrote.
     pub(super) fn record_writes(&self, block: BlockNumber, mods: &[EntityModification]) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.pending.is_empty() {
+        if inner.blocks.is_empty() {
             // Only runs launched from now on can be checked, and their snapshots start here.
             inner.written.clear();
             inner.written_types.clear();
@@ -200,7 +229,7 @@ impl Speculations {
         }
         if inner.written.len() > 1_000_000 {
             // Writes at or before every pending snapshot cannot invalidate anything.
-            if let Some(oldest) = inner.pending.values().map(|p| p.snapshot).min() {
+            if let Some(oldest) = inner.blocks.values().map(|b| b.snapshot).min() {
                 inner.written.retain(|_, b| *b > oldest);
                 inner.written_types.retain(|_, b| *b > oldest);
             }
@@ -221,6 +250,9 @@ impl Speculations {
         if log.unsupported {
             return false;
         }
+        if log.reads.is_empty() && log.related_types.is_empty() {
+            return true;
+        }
         let inner = self.inner.lock().unwrap();
         let changed = |b: Option<&BlockNumber>| b.is_some_and(|b| *b > snapshot);
         log.reads
@@ -231,29 +263,31 @@ impl Speculations {
             })
     }
 
-    /// Waits for `pending` (one per candidate host of a trigger, in host order) and returns,
-    /// per host, its state (`None`: the trigger does not match the host), if every run can be
-    /// used as is.
-    pub(super) async fn resolve(
+    /// Takes trigger `trigger`'s runs for `hosts` (its candidate hosts, in order) and returns,
+    /// per host, the state to replay (`None`: the trigger does not match the host), if every
+    /// run can be used as is.
+    pub(super) fn resolve(
         &self,
-        pending: Vec<Pending>,
+        ready: &mut ReadyRuns,
+        trigger: usize,
+        hosts: impl Iterator<Item = usize>,
         state: &BlockState,
     ) -> Option<Vec<Option<BlockState>>> {
-        let mut out = Vec::with_capacity(pending.len());
-        for Pending { snapshot, result } in pending {
-            match result.await {
-                Ok(Ok(SpeculativeRun::Ran {
+        let mut out = Vec::new();
+        for host in hosts {
+            match ready.runs.remove(&(trigger, host))? {
+                Ok(SpeculativeRun::Ran {
                     state: spec,
                     handler,
-                })) => {
-                    let valid = self.valid(snapshot, &spec, state);
+                }) => {
+                    let valid = self.valid(ready.snapshot, &spec, state);
                     self.stats.judged(&handler, valid);
                     if !valid {
                         return None;
                     }
                     out.push(Some(spec));
                 }
-                Ok(Ok(SpeculativeRun::NotMatched)) => out.push(None),
+                Ok(SpeculativeRun::NotMatched) => out.push(None),
                 _ => return None,
             }
         }

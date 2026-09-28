@@ -958,6 +958,14 @@ where
         };
 
         let hash = block.ptr().hash;
+        let mut ready = {
+            let _section = self
+                .metrics
+                .host
+                .stopwatch
+                .start_section("speculation_wait");
+            speculations.take_block(&hash).await
+        };
         let mut state = block_state;
         for (i, runnable) in runnables.into_iter().enumerate() {
             let RunnableTriggers {
@@ -969,13 +977,12 @@ where
             }
 
             // Use the speculative runs if every host of the trigger has a usable one.
-            let keys = hosted_triggers
+            let hosts = hosted_triggers
                 .iter()
-                .map(|ht| (hash.clone(), i, speculation::host_id(ht.host)));
-            let specs = match speculations.take_all(keys) {
-                Some(pending) => speculations.resolve(pending, &state).await,
-                None => None,
-            };
+                .map(|ht| speculation::host_id(ht.host));
+            let specs = ready
+                .as_mut()
+                .and_then(|ready| speculations.resolve(ready, i, hosts, &state));
             // Every host here matched the trigger, so every run must have run.
             let specs = specs.and_then(|specs| specs.into_iter().collect::<Option<Vec<_>>>());
             if let Some(specs) = specs {
@@ -1025,11 +1032,11 @@ where
         while self.lookahead.len() < speculation::LOOKAHEAD_BLOCKS
             && speculations.pending_len() < speculation::MAX_PENDING
         {
-            let Some(mut event) = block_stream.next().now_or_never() else {
+            let Some(event) = block_stream.next().now_or_never() else {
                 break;
             };
             let is_block = matches!(event, Some(Ok(BlockStreamEvent::ProcessBlock(..))));
-            if let Some(Ok(BlockStreamEvent::ProcessBlock(block, _))) = &mut event {
+            if let Some(Ok(BlockStreamEvent::ProcessBlock(block, _))) = &event {
                 self.speculate_block(block);
             }
             self.lookahead.push_back(event);
@@ -1039,58 +1046,76 @@ where
         }
     }
 
-    /// Starts a speculative run for every (trigger, candidate host) pair of `block`; the runs
-    /// match and decode the trigger themselves.
-    fn speculate_block(&self, block: &mut BlockWithTriggers<C>) {
+    /// Starts a speculative run for every (trigger, candidate host) pair of `block`, all in one
+    /// task on the speculation runtime; the runs match and decode the trigger themselves.
+    fn speculate_block(&self, block: &BlockWithTriggers<C>) {
         let Some(speculations) = &self.speculations else {
             return;
         };
         let snapshot = self.inputs.store.block_ptr().map_or(-1, |ptr| ptr.number);
         let region = PoICausalityRegion::from_network(&self.inputs.network);
         let ptr = block.ptr();
-        let chain_block = Arc::new(block.block.clone());
-        let stats = speculations.stats.clone();
-        let worth_running: Arc<dyn Fn(&str) -> bool + Send + Sync> =
-            Arc::new(move |handler| stats.worth_running(handler));
-        // Whether every candidate host of every trigger got a run, so the runner can skip
+        // Whether every candidate host of every trigger gets a run, so the runner can skip
         // matching.
         let mut complete = true;
         let mut launched = Vec::with_capacity(block.trigger_data.len());
+        let mut jobs = Vec::new();
         for (i, trigger) in block.trigger_data.iter().enumerate() {
             let mut hosts = Vec::new();
             match trigger {
                 Trigger::Chain(data) => {
                     for host in self.ctx.instance.onchain_hosts_for_trigger(data) {
-                        if host.poi_causality_region() != Some(region.as_str()) {
+                        if !host.can_speculate()
+                            || host.poi_causality_region() != Some(region.as_str())
+                        {
                             complete = false;
                             continue;
                         }
                         let id = speculation::host_id(host.as_ref());
-                        let mut state = BlockState::new(
-                            self.inputs.store.clone(),
-                            LfuCache::new(),
-                            SeqGenerator::new(ptr.number),
-                        );
-                        state.speculation = Some(Default::default());
-                        match host.speculate_trigger(
-                            &self.logger,
-                            TriggerData::Onchain(data.clone()),
-                            chain_block.clone(),
-                            state,
-                            worth_running.clone(),
-                        ) {
-                            Some(result) => {
-                                speculations.insert((ptr.hash.clone(), i, id), snapshot, result);
-                                hosts.push(id);
-                            }
-                            None => complete = false,
-                        }
+                        hosts.push(id);
+                        jobs.push(((i, id), host, TriggerData::Onchain(data.clone())));
                     }
                 }
                 Trigger::Subgraph(_) => complete = false,
             }
             launched.push(hosts);
         }
+        if jobs.is_empty() {
+            return;
+        }
+
+        let (sender, receiver) = graph::futures03::channel::oneshot::channel();
+        let count = jobs.len();
+        let chain_block = Arc::new(block.block.clone());
+        let store = self.inputs.store.clone();
+        let logger = self.logger.clone();
+        let stats = speculations.stats.clone();
+        let worth_running: Arc<dyn Fn(String) -> bool + Send + Sync> =
+            Arc::new(move |handler: String| stats.worth_running(&handler));
+        let number = ptr.number;
+        let run = async move {
+            // The block's runs proceed together, so their host calls overlap.
+            let runs = jobs.into_iter().map(|(key, host, trigger)| {
+                let mut state =
+                    BlockState::new(store.clone(), LfuCache::new(), SeqGenerator::new(number));
+                state.speculation = Some(Default::default());
+                let run = host.run_speculative(
+                    logger.clone(),
+                    trigger,
+                    chain_block.clone(),
+                    state,
+                    worth_running.clone(),
+                );
+                async move { (key, run.await) }
+            });
+            let results = graph::futures03::future::join_all(runs).await;
+            // The runner may have dropped the block's runs (a revert, say).
+            let _ = sender.send(results);
+        };
+        if !graph_runtime_wasm::mapping::spawn_speculative(run) {
+            return;
+        }
+        speculations.insert_block(ptr.hash.clone(), snapshot, count, receiver);
         if complete {
             speculations.launched(
                 ptr.hash,
@@ -1120,17 +1145,23 @@ where
             .as_ref()
             .expect("launched blocks exist only with speculation on");
         let hash = block.ptr().hash;
+        let mut ready = {
+            let _section = self
+                .metrics
+                .host
+                .stopwatch
+                .start_section("speculation_wait");
+            speculations.take_block(&hash).await
+        };
         let mut state = block_state;
         for ((i, trigger), hosts) in triggers.into_iter().enumerate().zip(launched.hosts) {
             if hosts.is_empty() {
                 // No host could match the trigger.
                 continue;
             }
-            let keys = hosts.iter().map(|id| (hash.clone(), i, *id));
-            let specs = match speculations.take_all(keys) {
-                Some(pending) => speculations.resolve(pending, &state).await,
-                None => None,
-            };
+            let specs = ready
+                .as_mut()
+                .and_then(|ready| speculations.resolve(ready, i, hosts.into_iter(), &state));
             if let Some(specs) = specs {
                 // Only the candidate hosts the trigger matched ran; none matched means the
                 // trigger has no handler here.
@@ -1138,6 +1169,11 @@ where
                 if !ran.is_empty() {
                     proof_of_indexing.start_handler(causality_region);
                 }
+                let _section = self
+                    .metrics
+                    .host
+                    .stopwatch
+                    .start_section("speculation_replay");
                 for spec in ran {
                     speculation::replay(
                         logger,

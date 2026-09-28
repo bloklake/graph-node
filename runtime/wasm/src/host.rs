@@ -298,63 +298,58 @@ where
         self.metrics.cheap_clone()
     }
 
-    fn speculate_trigger(
+    fn can_speculate(&self) -> bool {
+        self.speculation.is_some() && crate::mapping::speculation_enabled()
+    }
+
+    async fn run_speculative(
         self: Arc<Self>,
-        logger: &Logger,
+        logger: Logger,
         trigger: TriggerData<C>,
         block: Arc<C::Block>,
         state: BlockState,
-        worth_running: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) -> Option<graph::futures03::channel::oneshot::Receiver<Result<SpeculativeRun, MappingError>>>
-    {
-        let (module, metrics) = self.speculation.clone()?;
-        let (sender, receiver) = graph::futures03::channel::oneshot::channel();
-        let logger = logger.cheap_clone();
-        let run = async move {
-            let mapping_trigger = match self.data_source.match_and_decode(&trigger, &block, &logger)
-            {
-                Ok(Some(mapping_trigger)) => mapping_trigger,
-                Ok(None) => {
-                    let _ = sender.send(Ok(SpeculativeRun::NotMatched));
-                    return;
-                }
-                Err(e) => {
-                    let _ = sender.send(Err(MappingError::Unknown(e)));
-                    return;
-                }
-            };
-            let handler = mapping_trigger.handler_name().to_string();
-            if !worth_running(&handler) {
-                let _ = sender.send(Ok(SpeculativeRun::Skipped { handler }));
-                return;
-            }
-            let ctx = MappingContext {
-                logger: logger.cheap_clone(),
-                host_exports: self.host_exports.cheap_clone(),
-                block_ptr: mapping_trigger.block_ptr(),
-                timestamp: mapping_trigger.timestamp(),
-                state,
-                // The runner writes the proof of indexing events when it replays the writes.
-                proof_of_indexing: SharedProofOfIndexing::ignored(),
-                host_fns: self.host_fns.cheap_clone(),
-                debug_fork: None,
-                mapping_logger: Logger::new(&logger, o!("component" => "UserMapping")),
-                instrument: false,
-            };
-            let experimental_features = ExperimentalFeatures {
-                allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
-            };
-            let result = crate::mapping::run_speculative(
-                module,
-                ctx,
-                mapping_trigger,
-                metrics,
-                experimental_features,
-            )
-            .await;
-            let _ = sender.send(result.map(|state| SpeculativeRun::Ran { state, handler }));
+        worth_running: Arc<dyn Fn(String) -> bool + Send + Sync>,
+    ) -> Result<SpeculativeRun, MappingError> {
+        let Some((module, metrics)) = self.speculation.clone() else {
+            return Err(MappingError::Unknown(anyhow!("speculation is off")));
         };
-        crate::mapping::spawn_speculative(run).then_some(receiver)
+        let mapping_trigger = match self.data_source.match_and_decode(&trigger, &block, &logger) {
+            Ok(Some(mapping_trigger)) => mapping_trigger,
+            Ok(None) => return Ok(SpeculativeRun::NotMatched),
+            Err(e) => return Err(MappingError::Unknown(e)),
+        };
+        let handler = mapping_trigger.handler_name().to_string();
+        if !worth_running(handler.clone()) {
+            return Ok(SpeculativeRun::Skipped { handler });
+        }
+        let Some(_permit) = crate::mapping::speculation_permit().await else {
+            return Err(MappingError::Unknown(anyhow!("speculation is off")));
+        };
+        let ctx = MappingContext {
+            logger: logger.cheap_clone(),
+            host_exports: self.host_exports.cheap_clone(),
+            block_ptr: mapping_trigger.block_ptr(),
+            timestamp: mapping_trigger.timestamp(),
+            state,
+            // The runner writes the proof of indexing events when it replays the writes.
+            proof_of_indexing: SharedProofOfIndexing::ignored(),
+            host_fns: self.host_fns.cheap_clone(),
+            debug_fork: None,
+            mapping_logger: Logger::new(&logger, o!("component" => "UserMapping")),
+            instrument: false,
+        };
+        let experimental_features = ExperimentalFeatures {
+            allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
+        };
+        crate::mapping::run_speculative(
+            module,
+            ctx,
+            mapping_trigger,
+            metrics,
+            experimental_features,
+        )
+        .await
+        .map(|state| SpeculativeRun::Ran { state, handler })
     }
 
     fn poi_causality_region(&self) -> Option<&str> {

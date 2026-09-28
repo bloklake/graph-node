@@ -211,22 +211,28 @@ fn speculation_runtime() -> Option<&'static (tokio::runtime::Runtime, Arc<tokio:
         .as_ref()
 }
 
-/// Spawns `run` as a speculative task once a concurrency permit is free; `false` when
-/// speculation is off.
-pub(crate) fn spawn_speculative<F>(run: F) -> bool
+/// Spawns `run` on the speculation runtime; `false` when speculation is off. Runs take a
+/// `speculation_permit` before they instantiate a module.
+pub fn spawn_speculative<F>(run: F) -> bool
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let Some((runtime, permits)) = speculation_runtime() else {
+    let Some((runtime, _)) = speculation_runtime() else {
         return false;
     };
-    let permits = permits.clone();
-    runtime.spawn(async move {
-        if let Ok(_permit) = permits.acquire_owned().await {
-            run.await;
-        }
-    });
+    runtime.spawn(run);
     true
+}
+
+/// Whether speculative runs are on.
+pub fn speculation_enabled() -> bool {
+    speculation_runtime().is_some()
+}
+
+/// Waits for one of the `GRAPH_SPECULATION_CONCURRENCY` slots for a run in flight.
+pub(crate) async fn speculation_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let (_, permits) = speculation_runtime()?;
+    permits.clone().acquire_owned().await.ok()
 }
 
 /// Instantiates the module and runs `trigger`, as a speculative run does.

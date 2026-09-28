@@ -95,19 +95,26 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     /// Return a metrics object for this host.
     fn host_metrics(&self) -> Arc<HostMetrics>;
 
-    /// Runs `trigger` ahead of time as a speculative task: matches and decodes it for this host
-    /// and, when it matches and `worth_running` agrees for the handler, runs the handler against
-    /// `state` (a fresh state whose `speculation` log records what the handler reads and
-    /// writes). `None` when this host cannot speculate; the default.
-    fn speculate_trigger(
+    /// Whether `run_speculative` can run this host's handlers ahead of time.
+    fn can_speculate(&self) -> bool {
+        false
+    }
+
+    /// Runs `trigger` ahead of time (on a speculation worker; see `can_speculate`): matches and
+    /// decodes it for this host and, when it matches and `worth_running` agrees for the
+    /// handler, runs the handler against `state` (a fresh state whose `speculation` log
+    /// records what the handler reads and writes).
+    async fn run_speculative(
         self: Arc<Self>,
-        _logger: &Logger,
+        _logger: Logger,
         _trigger: TriggerData<C>,
         _block: Arc<C::Block>,
         _state: BlockState,
-        _worth_running: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    ) -> Option<futures03::channel::oneshot::Receiver<Result<SpeculativeRun, MappingError>>> {
-        None
+        _worth_running: Arc<dyn Fn(String) -> bool + Send + Sync>,
+    ) -> Result<SpeculativeRun, MappingError> {
+        Err(MappingError::Unknown(anyhow::anyhow!(
+            "this host cannot run handlers speculatively"
+        )))
     }
 
     /// The causality region this host's handlers write proof of indexing events to.
