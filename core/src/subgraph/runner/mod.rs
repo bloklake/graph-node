@@ -980,9 +980,9 @@ where
             let hosts = hosted_triggers
                 .iter()
                 .map(|ht| speculation::host_id(ht.host));
-            let specs = ready
-                .as_mut()
-                .and_then(|ready| speculations.resolve(ready, i, hosts, &state));
+            let specs = ready.as_mut().and_then(|ready| {
+                speculations.resolve(ready, block.ptr().number, i, hosts, &state)
+            });
             // Every host here matched the trigger, so every run must have run.
             let specs = specs.and_then(|specs| specs.into_iter().collect::<Option<Vec<_>>>());
             if let Some(specs) = specs {
@@ -1159,9 +1159,9 @@ where
                 // No host could match the trigger.
                 continue;
             }
-            let specs = ready
-                .as_mut()
-                .and_then(|ready| speculations.resolve(ready, i, hosts.into_iter(), &state));
+            let specs = ready.as_mut().and_then(|ready| {
+                speculations.resolve(ready, block.ptr().number, i, hosts.into_iter(), &state)
+            });
             if let Some(specs) = specs {
                 // Only the candidate hosts the trigger matched ran; none matched means the
                 // trigger has no handler here.

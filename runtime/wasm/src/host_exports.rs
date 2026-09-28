@@ -341,13 +341,16 @@ impl HostExports {
 
         if let Some(log) = state.speculation.as_mut() {
             // An entity that is not valid on its own is validated merged with the stored one.
-            if entity.validate(&key).is_err() {
+            let valid = entity.validate(&key).is_ok();
+            if !valid {
                 log.reads.push(key.clone());
             }
             log.ops
                 .push(graph::components::subgraph::SpeculativeOp::Set {
                     key: key.clone(),
                     entity: entity.clone(),
+                    poi_id: key.entity_id.to_string(),
+                    valid,
                 });
         }
 

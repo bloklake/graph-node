@@ -66,6 +66,7 @@ impl StopwatchMetrics {
             logger,
             stage,
             shard,
+            counters: std::collections::HashMap::new(),
             section_stack: Vec::new(),
             timer: Instant::now(),
         };
@@ -126,6 +127,12 @@ struct StopwatchInner {
     // Counter for the total time the subgraph spent syncing in various sections.
     counter: CounterVec,
 
+    // The counter of each section seen, so switching sections does not look up labels.
+    counters: std::collections::HashMap<
+        String,
+        prometheus::core::GenericCounter<prometheus::core::AtomicF64>,
+    >,
+
     // The top section (last item) is the one that's currently executing.
     section_stack: Vec<String>,
 
@@ -144,14 +151,23 @@ impl StopwatchInner {
         if let Some(section) = self.section_stack.last() {
             // Register the current timer.
             let elapsed = self.timer.elapsed().as_secs_f64();
-            self.counter
-                .get_metric_with_label_values(&[section, &self.stage, &self.shard])
-                .map(|counter| counter.inc_by(elapsed))
-                .unwrap_or_else(|e| {
-                    error!(self.logger, "failed to find counter for section";
-                    "id" => section,
-                    "error" => e.to_string());
-                });
+            if let Some(counter) = self.counters.get(section) {
+                counter.inc_by(elapsed);
+            } else {
+                match self.counter.get_metric_with_label_values(&[
+                    section,
+                    &self.stage,
+                    &self.shard,
+                ]) {
+                    Ok(counter) => {
+                        counter.inc_by(elapsed);
+                        self.counters.insert(section.clone(), counter);
+                    }
+                    Err(e) => error!(self.logger, "failed to find counter for section";
+                        "id" => section,
+                        "error" => e.to_string()),
+                }
+            }
         }
 
         // Reset the timer.

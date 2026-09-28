@@ -272,7 +272,9 @@ impl EntityCache {
         let mut entity: Option<Arc<Entity>> = match scope {
             GetScope::Store => {
                 if !self.current.contains_key(key) {
-                    let entity = if self.complete {
+                    // Immutable entities are not kept in `current` after they are written
+                    // (see `as_modifications`), so `complete` does not speak for them.
+                    let entity = if self.complete && !key.entity_type.is_immutable() {
                         None
                     } else {
                         self.store.get(key).await?
@@ -390,7 +392,19 @@ impl EntityCache {
     ) -> Result<(), anyhow::Error> {
         // check the validate for derived fields
         let is_valid = entity.validate(&key).is_ok();
+        self.set_validated(key, entity, is_valid, write_capacity_remaining)
+            .await
+    }
 
+    /// `set` for an entity whose validity on its own (`entity.validate(&key).is_ok()`) is
+    /// already known; replaying a speculative handler run knows it.
+    pub async fn set_validated(
+        &mut self,
+        key: EntityKey,
+        entity: Entity,
+        is_valid: bool,
+        write_capacity_remaining: Option<&mut usize>,
+    ) -> Result<(), anyhow::Error> {
         if let Some(write_capacity_remaining) = write_capacity_remaining {
             let weight = entity.weight();
             if !self.current.contains_key(&key) && weight > *write_capacity_remaining {
@@ -526,7 +540,11 @@ impl EntityCache {
                 | (None, EntityOp::Overwrite(mut updates)) => {
                     updates.remove_null_fields();
                     let data = Arc::new(updates);
-                    self.current.insert(key.clone(), Some(data.cheap_clone()));
+                    // Immutable entities are inserted once and rarely read back; keeping them
+                    // would only cost cache upkeep and evict entities that are read.
+                    if !key.entity_type.is_immutable() {
+                        self.current.insert(key.clone(), Some(data.cheap_clone()));
+                    }
                     Some(Insert {
                         key,
                         data,

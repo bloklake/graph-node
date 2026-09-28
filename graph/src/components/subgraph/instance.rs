@@ -67,8 +67,14 @@ pub struct InstanceDSTemplateInfo {
 /// A store write a speculatively executed handler made, in the order it made them.
 #[derive(Debug)]
 pub enum SpeculativeOp {
-    /// `store.set`: the key and the entity as the handler passed it (no vid yet).
-    Set { key: EntityKey, entity: Entity },
+    /// `store.set`: the key, the entity as the handler passed it (no vid yet), the id as the
+    /// proof of indexing records it, and whether the entity was valid on its own.
+    Set {
+        key: EntityKey,
+        entity: Entity,
+        poi_id: String,
+        valid: bool,
+    },
     /// `store.remove`: the key, and the type and id strings the proof of indexing records.
     Remove {
         key: EntityKey,

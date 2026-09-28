@@ -136,9 +136,13 @@ struct Inner {
     /// Runs of all `blocks`.
     pending_runs: usize,
     /// The last block in which each entity (type) was written, for blocks the runner processed
-    /// while speculative runs may have been reading older state.
+    /// while speculative runs may have been reading older state. Keys are only recorded for
+    /// `watched` types.
     written: HashMap<EntityKey, BlockNumber>,
     written_types: HashMap<EntityType, BlockNumber>,
+    /// Entity types some run read, with the first block whose writes are recorded. Types no
+    /// run reads (insert-only events, say) cost no bookkeeping.
+    watched: HashMap<EntityType, BlockNumber>,
 }
 
 #[derive(Default)]
@@ -205,6 +209,7 @@ impl Speculations {
         inner.pending_runs = 0;
         inner.written.clear();
         inner.written_types.clear();
+        inner.watched.clear();
     }
 
     /// Notes what a processed block wrote.
@@ -218,7 +223,9 @@ impl Speculations {
         }
         for m in mods {
             let key = m.key();
-            inner.written.insert(key.clone(), block);
+            if inner.watched.contains_key(&key.entity_type) {
+                inner.written.insert(key.clone(), block);
+            }
             if inner
                 .written_types
                 .get(&key.entity_type)
@@ -237,8 +244,14 @@ impl Speculations {
     }
 
     /// Whether `spec` (a finished run from `snapshot`) is what running the trigger now would
-    /// produce, given `state`, the block state so far.
-    fn valid(&self, snapshot: BlockNumber, spec: &BlockState, state: &BlockState) -> bool {
+    /// produce, given `state`, the state of `block` (being processed) so far.
+    fn valid(
+        &self,
+        block: BlockNumber,
+        snapshot: BlockNumber,
+        spec: &BlockState,
+        state: &BlockState,
+    ) -> bool {
         if !spec.deterministic_errors.is_empty()
             || state.write_capacity_remaining < MIN_WRITE_CAPACITY
         {
@@ -253,7 +266,24 @@ impl Speculations {
         if log.reads.is_empty() && log.related_types.is_empty() {
             return true;
         }
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        // Writes to a key are known from `since` on; they cover the run only if they are known
+        // from just after its snapshot. A type read for the first time is watched from `block`
+        // on (its writes are recorded when `block` is committed).
+        let mut covered = true;
+        for key in &log.reads {
+            match inner.watched.get(&key.entity_type) {
+                Some(since) if *since <= snapshot + 1 => {}
+                Some(_) => covered = false,
+                None => {
+                    inner.watched.insert(key.entity_type.clone(), block);
+                    covered = false;
+                }
+            }
+        }
+        if !covered {
+            return false;
+        }
         let changed = |b: Option<&BlockNumber>| b.is_some_and(|b| *b > snapshot);
         log.reads
             .iter()
@@ -269,6 +299,7 @@ impl Speculations {
     pub(super) fn resolve(
         &self,
         ready: &mut ReadyRuns,
+        block: BlockNumber,
         trigger: usize,
         hosts: impl Iterator<Item = usize>,
         state: &BlockState,
@@ -280,7 +311,7 @@ impl Speculations {
                     state: spec,
                     handler,
                 }) => {
-                    let valid = self.valid(ready.snapshot, &spec, state);
+                    let valid = self.valid(block, ready.snapshot, &spec, state);
                     self.stats.judged(&handler, valid);
                     if !valid {
                         return None;
@@ -312,11 +343,16 @@ pub(super) async fn replay(
     state.enter_handler();
     for op in log.ops {
         match op {
-            SpeculativeOp::Set { key, entity } => {
+            SpeculativeOp::Set {
+                key,
+                entity,
+                poi_id,
+                valid,
+            } => {
                 proof_of_indexing.write_event(
                     &ProofOfIndexingEvent::SetEntity {
                         entity_type: key.entity_type.typename(),
-                        id: &key.entity_id.to_string(),
+                        id: &poi_id,
                         data: &entity,
                     },
                     region,
@@ -324,7 +360,12 @@ pub(super) async fn replay(
                 );
                 if let Err(e) = state
                     .entity_cache
-                    .set(key, entity, Some(&mut state.write_capacity_remaining))
+                    .set_validated(
+                        key,
+                        entity,
+                        valid,
+                        Some(&mut state.write_capacity_remaining),
+                    )
                     .await
                 {
                     state.exit_handler();
