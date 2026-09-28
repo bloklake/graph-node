@@ -95,15 +95,18 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     /// Return a metrics object for this host.
     fn host_metrics(&self) -> Arc<HostMetrics>;
 
-    /// Runs `trigger` ahead of time on a speculation thread against `state` (a fresh state
-    /// whose `speculation` log records what the handler reads and writes). `None` when this
-    /// host cannot speculate; the default.
-    fn speculate(
-        &self,
+    /// Runs `trigger` ahead of time as a speculative task: matches and decodes it for this host
+    /// and, when it matches and `worth_running` agrees for the handler, runs the handler against
+    /// `state` (a fresh state whose `speculation` log records what the handler reads and
+    /// writes). `None` when this host cannot speculate; the default.
+    fn speculate_trigger(
+        self: Arc<Self>,
         _logger: &Logger,
-        _trigger: TriggerWithHandler<MappingTrigger<C>>,
+        _trigger: TriggerData<C>,
+        _block: Arc<C::Block>,
         _state: BlockState,
-    ) -> Option<futures03::channel::oneshot::Receiver<Result<BlockState, MappingError>>> {
+        _worth_running: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Option<futures03::channel::oneshot::Receiver<Result<SpeculativeRun, MappingError>>> {
         None
     }
 
@@ -111,6 +114,16 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     fn poi_causality_region(&self) -> Option<&str> {
         None
     }
+}
+
+/// The outcome of `RuntimeHost::speculate_trigger`.
+pub enum SpeculativeRun {
+    /// The handler ran; its block state records what it read and wrote.
+    Ran { state: BlockState, handler: String },
+    /// The trigger does not match the host.
+    NotMatched,
+    /// The host matched but its handler was not run (not worth it).
+    Skipped { handler: String },
 }
 
 pub struct HostMetrics {

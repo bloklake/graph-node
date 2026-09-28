@@ -211,50 +211,56 @@ fn speculation_runtime() -> Option<&'static (tokio::runtime::Runtime, Arc<tokio:
         .as_ref()
 }
 
-/// Runs `trigger` against `ctx` as a speculative task and delivers the resulting block state.
-/// `None` when speculation is off.
-pub(crate) fn speculate<C: Blockchain>(
+/// Spawns `run` as a speculative task once a concurrency permit is free; `false` when
+/// speculation is off.
+pub(crate) fn spawn_speculative<F>(run: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some((runtime, permits)) = speculation_runtime() else {
+        return false;
+    };
+    let permits = permits.clone();
+    runtime.spawn(async move {
+        if let Ok(_permit) = permits.acquire_owned().await {
+            run.await;
+        }
+    });
+    true
+}
+
+/// Instantiates the module and runs `trigger`, as a speculative run does.
+pub(crate) async fn run_speculative<C: Blockchain>(
     valid_module: Arc<ValidModule>,
     ctx: MappingContext,
     trigger: TriggerWithHandler<MappingTrigger<C>>,
     host_metrics: Arc<HostMetrics>,
     experimental_features: ExperimentalFeatures,
-) -> Option<graph::futures03::channel::oneshot::Receiver<Result<BlockState, MappingError>>>
+) -> Result<BlockState, MappingError>
 where
     <C as Blockchain>::MappingTrigger: ToAscPtr,
 {
-    let (runtime, permits) = speculation_runtime()?;
-    let permits = permits.clone();
-    let (sender, receiver) = graph::futures03::channel::oneshot::channel();
-    runtime.spawn(async move {
-        let Ok(_permit) = permits.acquire_owned().await else {
-            return;
-        };
-        let run = async move {
-            let module = WasmInstance::from_valid_module_with_ctx(
-                valid_module,
-                ctx,
-                host_metrics,
-                experimental_features,
-            )
+    let run = async move {
+        let module = WasmInstance::from_valid_module_with_ctx(
+            valid_module,
+            ctx,
+            host_metrics,
+            experimental_features,
+        )
+        .await
+        .map_err(MappingError::Unknown)?;
+        module
+            .handle_trigger(trigger)
             .await
-            .map_err(MappingError::Unknown)?;
-            module
-                .handle_trigger(trigger)
-                .await
-                .map(|(state, _gas)| state)
-        };
-        let result = graph::futures03::FutureExt::catch_unwind(AssertUnwindSafe(run))
-            .await
-            .unwrap_or_else(|_| {
-                Err(MappingError::Unknown(anyhow!(
-                    "speculative handler run panicked"
-                )))
-            });
-        // The runner may have dropped the run (a revert, say).
-        let _ = sender.send(result);
-    });
-    Some(receiver)
+            .map(|(state, _gas)| state)
+    };
+    graph::futures03::FutureExt::catch_unwind(AssertUnwindSafe(run))
+        .await
+        .unwrap_or_else(|_| {
+            Err(MappingError::Unknown(anyhow!(
+                "speculative handler run panicked"
+            )))
+        })
 }
 
 async fn instantiate_module<C: Blockchain>(

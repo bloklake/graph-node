@@ -278,6 +278,12 @@ where
         self.causality_region_seq.next_val()
     }
 
+    /// The onchain hosts `hosts_for_trigger` returns for an onchain trigger, as shared handles.
+    pub fn onchain_hosts_for_trigger(&self, trigger: &C::TriggerData) -> Vec<Arc<T::Host>> {
+        self.onchain_hosts
+            .matches_by_address_arc(trigger.address_match())
+    }
+
     pub fn hosts_generation(&self) -> u64 {
         self.hosts_generation
     }

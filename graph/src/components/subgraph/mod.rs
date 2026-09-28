@@ -7,7 +7,7 @@ mod settings;
 
 pub use crate::prelude::Entity;
 
-pub use self::host::{HostMetrics, MappingError, RuntimeHost, RuntimeHostBuilder};
+pub use self::host::{HostMetrics, MappingError, RuntimeHost, RuntimeHostBuilder, SpeculativeRun};
 pub use self::instance::{
     BlockState, BlockStateCheckpoint, InstanceDSTemplate, InstanceDSTemplateInfo, SpeculationLog,
     SpeculativeOp,

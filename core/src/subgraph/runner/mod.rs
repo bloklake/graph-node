@@ -976,6 +976,8 @@ where
                 Some(pending) => speculations.resolve(pending, &state).await,
                 None => None,
             };
+            // Every host here matched the trigger, so every run must have run.
+            let specs = specs.and_then(|specs| specs.into_iter().collect::<Option<Vec<_>>>());
             if let Some(specs) = specs {
                 proof_of_indexing.start_handler(causality_region);
                 for spec in specs {
@@ -1037,7 +1039,8 @@ where
         }
     }
 
-    /// Starts a speculative run for every (trigger, host) pair of `block`.
+    /// Starts a speculative run for every (trigger, candidate host) pair of `block`; the runs
+    /// match and decode the trigger themselves.
     fn speculate_block(&self, block: &mut BlockWithTriggers<C>) {
         let Some(speculations) = &self.speculations else {
             return;
@@ -1046,65 +1049,47 @@ where
         let region = PoICausalityRegion::from_network(&self.inputs.network);
         let ptr = block.ptr();
         let chain_block = Arc::new(block.block.clone());
-        let triggers = std::mem::take(&mut block.trigger_data);
-        // Whether every (trigger, host) match got a run, so the runner can skip matching.
+        let stats = speculations.stats.clone();
+        let worth_running: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+            Arc::new(move |handler| stats.worth_running(handler));
+        // Whether every candidate host of every trigger got a run, so the runner can skip
+        // matching.
         let mut complete = true;
-        let mut launched = Vec::with_capacity(triggers.len());
-        for (i, trigger) in triggers.into_iter().enumerate() {
-            let data = match trigger {
-                Trigger::Chain(t) => TriggerData::Onchain(t),
-                Trigger::Subgraph(t) => TriggerData::Subgraph(t),
-            };
+        let mut launched = Vec::with_capacity(block.trigger_data.len());
+        for (i, trigger) in block.trigger_data.iter().enumerate() {
             let mut hosts = Vec::new();
-            if matches!(data, TriggerData::Onchain(_)) {
-                for host in self.ctx.instance.hosts_for_trigger(&data) {
-                    let mapping_trigger =
-                        match host.match_and_decode(&data, &chain_block, &self.logger) {
-                            Ok(Some(mapping_trigger)) => mapping_trigger,
-                            Ok(None) => continue,
-                            Err(_) => {
-                                complete = false;
-                                continue;
-                            }
-                        };
-                    if host.poi_causality_region() != Some(region.as_str()) {
-                        complete = false;
-                        continue;
-                    }
-                    let handler = mapping_trigger.handler_name().to_string();
-                    if !speculations.worth_running(&handler) {
-                        complete = false;
-                        continue;
-                    }
-                    let mut state = BlockState::new(
-                        self.inputs.store.clone(),
-                        LfuCache::new(),
-                        SeqGenerator::new(ptr.number),
-                    );
-                    state.speculation = Some(Default::default());
-                    match host.speculate(&self.logger, mapping_trigger, state) {
-                        Some(result) => {
-                            let id = speculation::host_id(host);
-                            speculations.insert(
-                                (ptr.hash.clone(), i, id),
-                                snapshot,
-                                handler,
-                                result,
-                            );
-                            hosts.push(id);
+            match trigger {
+                Trigger::Chain(data) => {
+                    for host in self.ctx.instance.onchain_hosts_for_trigger(data) {
+                        if host.poi_causality_region() != Some(region.as_str()) {
+                            complete = false;
+                            continue;
                         }
-                        None => complete = false,
+                        let id = speculation::host_id(host.as_ref());
+                        let mut state = BlockState::new(
+                            self.inputs.store.clone(),
+                            LfuCache::new(),
+                            SeqGenerator::new(ptr.number),
+                        );
+                        state.speculation = Some(Default::default());
+                        match host.speculate_trigger(
+                            &self.logger,
+                            TriggerData::Onchain(data.clone()),
+                            chain_block.clone(),
+                            state,
+                            worth_running.clone(),
+                        ) {
+                            Some(result) => {
+                                speculations.insert((ptr.hash.clone(), i, id), snapshot, result);
+                                hosts.push(id);
+                            }
+                            None => complete = false,
+                        }
                     }
                 }
-            } else {
-                complete = false;
+                Trigger::Subgraph(_) => complete = false,
             }
             launched.push(hosts);
-            block.trigger_data.push(match data {
-                TriggerData::Onchain(t) => Trigger::Chain(t),
-                TriggerData::Subgraph(t) => Trigger::Subgraph(t),
-                TriggerData::Offchain(_) => unreachable!("block triggers are never offchain"),
-            });
         }
         if complete {
             speculations.launched(
@@ -1138,7 +1123,7 @@ where
         let mut state = block_state;
         for ((i, trigger), hosts) in triggers.into_iter().enumerate().zip(launched.hosts) {
             if hosts.is_empty() {
-                // No host matched the trigger.
+                // No host could match the trigger.
                 continue;
             }
             let keys = hosts.iter().map(|id| (hash.clone(), i, *id));
@@ -1147,8 +1132,13 @@ where
                 None => None,
             };
             if let Some(specs) = specs {
-                proof_of_indexing.start_handler(causality_region);
-                for spec in specs {
+                // Only the candidate hosts the trigger matched ran; none matched means the
+                // trigger has no handler here.
+                let ran: Vec<_> = specs.into_iter().flatten().collect();
+                if !ran.is_empty() {
+                    proof_of_indexing.start_handler(causality_region);
+                }
+                for spec in ran {
                     speculation::replay(
                         logger,
                         spec,
