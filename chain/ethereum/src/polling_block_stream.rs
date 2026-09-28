@@ -114,6 +114,8 @@ pub struct PollingBlockStream {
     consecutive_err_count: u32,
     chain_head_update_stream: ChainHeadUpdateStream,
     ctx: PollingBlockStreamContext,
+    /// Events buffered ahead of the consumer.
+    buffer_size: usize,
 }
 
 // This is the same as `ReconciliationStep` but without retries.
@@ -158,7 +160,19 @@ impl PollingBlockStream {
                 target_triggers_per_block_range,
                 unified_api_version,
             },
+            buffer_size: BUFFERED_BLOCK_STREAM_SIZE,
         }
+    }
+
+    /// For a source that answers large ranges in one request (a datalake): start with ranges
+    /// of `initial_range` blocks instead of growing from one block, and let `buffer_size`
+    /// events queue up ahead of the consumer.
+    pub fn with_large_ranges(mut self, initial_range: BlockNumber, buffer_size: usize) -> Self {
+        self.ctx.previous_block_range_size = initial_range.max(1) / 10;
+        // No density estimate yet: size the first range by `initial_range` alone.
+        self.ctx.previous_triggers_per_block = 0.0;
+        self.buffer_size = buffer_size;
+        self
     }
 }
 
@@ -482,7 +496,7 @@ impl PollingBlockStreamContext {
 
 impl BlockStream<Chain> for PollingBlockStream {
     fn buffer_size_hint(&self) -> usize {
-        BUFFERED_BLOCK_STREAM_SIZE
+        self.buffer_size
     }
 }
 

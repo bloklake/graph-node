@@ -251,7 +251,7 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
             ),
         };
 
-        Ok(Box::new(PollingBlockStream::new(
+        let stream = PollingBlockStream::new(
             chain_head_update_stream,
             Arc::new(adapter),
             deployment.hash,
@@ -263,7 +263,15 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
             target_triggers_per_block_range,
             unified_api_version,
             subgraph_current_block,
-        )))
+        );
+        let stream = match &chain.settings.datalake {
+            // First range: a tenth of the largest.
+            Some(datalake) => {
+                stream.with_large_ranges(datalake.settings().max_block_range / 10, 2_000)
+            }
+            None => stream,
+        };
+        Ok(Box::new(stream))
     }
 }
 

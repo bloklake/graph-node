@@ -855,7 +855,20 @@ impl DatalakeClient {
 
         let next = scanned.to + 1;
         if next <= height {
-            let size = to - from + 1;
+            // Predict the stream's next range the way it sizes ranges: at most tenfold the last
+            // one, and about `target_triggers` at the density just seen.
+            let scanned_size = scanned.to - from + 1;
+            let logs: usize = scanned.blocks.iter().map(|(_, logs)| logs.len()).sum();
+            let by_density = if logs == 0 {
+                BlockNumber::MAX
+            } else {
+                let per_block = logs as f64 / scanned_size as f64;
+                (self.settings.target_triggers as f64 / per_block).max(1.0) as BlockNumber
+            };
+            let size = scanned_size
+                .saturating_mul(10)
+                .min(self.settings.max_block_range)
+                .min(by_density);
             let client = self.clone();
             let logger = logger.clone();
             let handle = tokio::spawn(async move {
