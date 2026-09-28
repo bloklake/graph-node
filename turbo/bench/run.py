@@ -223,8 +223,8 @@ indexers = [ "default" ]
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
     d, rows = digest(db, case["end"])
-    return dict(case=args.case, seconds=round(t1 - t0, 2), deploy=round(t_deployed - t0, 2), digest=d, rows=rows,
-                deployment=deployment)
+    return dict(case=args.case, seconds=round(t1 - t0, 2), deploy=round(t_deployed - t0, 2),
+                after_deploy=round(t1 - t_deployed, 2), digest=d, rows=rows, deployment=deployment)
 
 
 def main():
