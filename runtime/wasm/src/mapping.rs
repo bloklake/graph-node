@@ -224,6 +224,52 @@ impl MappingContext {
 // See the start_index comment below for more information.
 const GN_START_FUNCTION_NAME: &str = "gn::start";
 
+/// The engine every module is compiled for. Sharing it lets all instances come from one
+/// pool (`GRAPH_WASM_INSTANCE_POOL`), so a trigger's instance reuses memory instead of mapping
+/// and unmapping a fresh reservation.
+fn shared_engine() -> Result<wasmtime::Engine, anyhow::Error> {
+    static ENGINE: std::sync::OnceLock<Result<wasmtime::Engine, String>> =
+        std::sync::OnceLock::new();
+    ENGINE
+        .get_or_init(|| build_engine().map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow!("creating the WASM engine failed: {e}"))
+}
+
+fn build_engine() -> Result<wasmtime::Engine, anyhow::Error> {
+    // We use Cranelift as a compilation engine. Cranelift is an optimizing compiler, but that
+    // should not cause determinism issues since it adheres to the Wasm spec and NaN
+    // canonicalization is enabled below. The optimization level is configurable via
+    // GRAPH_WASM_OPT_LEVEL (default: speed).
+    let mut config = wasmtime::Config::new();
+    config.strategy(wasmtime::Strategy::Cranelift);
+    config.epoch_interruption(true);
+    config.cranelift_nan_canonicalization(true); // For NaN determinism.
+    config.cranelift_opt_level(match ENV_VARS.mappings.wasm_opt_level {
+        graph::env::WasmOptLevel::None => wasmtime::OptLevel::None,
+        graph::env::WasmOptLevel::Speed => wasmtime::OptLevel::Speed,
+        graph::env::WasmOptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
+    });
+    config.max_wasm_stack(ENV_VARS.mappings.max_stack_size);
+
+    let slots = ENV_VARS.mappings.wasm_instance_pool;
+    if slots > 0 {
+        let mut pool = wasmtime::PoolingAllocationConfig::default();
+        pool.total_core_instances(slots)
+            .total_memories(slots)
+            .total_tables(slots)
+            .total_stacks(slots)
+            // Mappings keep their state small; zeroing the first MiB on reuse is cheaper
+            // than faulting the pages back in.
+            .linear_memory_keep_resident(1 << 20)
+            .table_keep_resident(1 << 16)
+            .table_elements(1 << 20)
+            .max_core_instance_size(1 << 22);
+        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pool));
+    }
+    Ok(wasmtime::Engine::new(&config)?)
+}
+
 /// A pre-processed and valid WASM module, ready to be started as a WasmModule.
 pub struct ValidModule {
     pub module: wasmtime::Module,
@@ -308,22 +354,7 @@ impl ValidModule {
                 .map_err(|_| anyhow!("Failed to inject gas counter"))?;
         let raw_module = parity_module.into_bytes()?;
 
-        // We use Cranelift as a compilation engine. Cranelift is an optimizing compiler, but that
-        // should not cause determinism issues since it adheres to the Wasm spec and NaN
-        // canonicalization is enabled below. The optimization level is configurable via
-        // GRAPH_WASM_OPT_LEVEL (default: speed).
-        let mut config = wasmtime::Config::new();
-        config.strategy(wasmtime::Strategy::Cranelift);
-        config.epoch_interruption(true);
-        config.cranelift_nan_canonicalization(true); // For NaN determinism.
-        config.cranelift_opt_level(match ENV_VARS.mappings.wasm_opt_level {
-            graph::env::WasmOptLevel::None => wasmtime::OptLevel::None,
-            graph::env::WasmOptLevel::Speed => wasmtime::OptLevel::Speed,
-            graph::env::WasmOptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
-        });
-        config.max_wasm_stack(ENV_VARS.mappings.max_stack_size);
-
-        let engine = &wasmtime::Engine::new(&config)?;
+        let engine = &shared_engine()?;
         let module = wasmtime::Module::from_binary(engine, &raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -339,21 +370,21 @@ impl ValidModule {
                 .push(module.to_string());
         }
 
-        let mut epoch_counter_abort_handle = None;
+        // Timeouts on instantiated modules trigger on epoch deltas; one task advances the
+        // shared engine's epoch every `timeout` (the timeout is the same for every module).
+        // See also: runtime-timeouts
+        let epoch_counter_abort_handle = None;
         if let Some(timeout) = timeout {
+            static EPOCH_COUNTER: std::sync::Once = std::sync::Once::new();
             let engine = engine.clone();
-
-            // The epoch counter task will perpetually increment the epoch every `timeout` seconds.
-            // Timeouts on instantiated modules will trigger on epoch deltas.
-            // Note: The epoch is an u64 so it will never overflow.
-            // See also: runtime-timeouts
-            let epoch_counter = async move {
-                loop {
-                    tokio::time::sleep(timeout).await;
-                    engine.increment_epoch();
-                }
-            };
-            epoch_counter_abort_handle = Some(graph::spawn(epoch_counter).abort_handle());
+            EPOCH_COUNTER.call_once(move || {
+                graph::spawn(async move {
+                    loop {
+                        tokio::time::sleep(timeout).await;
+                        engine.increment_epoch();
+                    }
+                });
+            });
         }
 
         let linker = crate::module::build_linker(engine, &import_name_to_modules)?;

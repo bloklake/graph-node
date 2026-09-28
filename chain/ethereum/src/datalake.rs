@@ -37,6 +37,7 @@ use graph::prelude::alloy::rpc::types::{Block, BlockTransactions, Header, Log};
 use graph::prelude::{BlockNumber, Logger, anyhow, debug, reqwest, serde_json, warn};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::adapter::{EthGetLogsFilter, TriggerFilter};
 
@@ -87,6 +88,8 @@ pub struct DatalakeClient {
     settings: DatalakeSettings,
     http: reqwest::Client,
     height: Mutex<Option<(Instant, Option<BlockNumber>)>>,
+    /// Scans started ahead of time, by filter fingerprint and first block.
+    prefetched: Mutex<HashMap<(u64, BlockNumber), JoinHandle<anyhow::Result<Scanned>>>>,
 }
 
 impl std::fmt::Debug for DatalakeClient {
@@ -122,6 +125,7 @@ impl DatalakeClient {
             settings,
             http,
             height: Mutex::new(None),
+            prefetched: Mutex::new(HashMap::new()),
         })
     }
 
@@ -668,6 +672,30 @@ fn logs(batches: &[RecordBatch], block_hashes: &BTreeMap<u64, B256>) -> anyhow::
     Ok(out)
 }
 
+fn block(
+    header: Header<AnyHeader>,
+    uncles: Vec<B256>,
+    transactions: Vec<AnyTransaction>,
+) -> LightEthereumBlock {
+    let block: AnyBlock = Block {
+        header,
+        uncles,
+        transactions: BlockTransactions::Full(transactions),
+        withdrawals: None,
+    };
+    LightEthereumBlock::new(block)
+}
+
+/// Identifies a set of filter objects, to match prefetched answers to later scans.
+fn fingerprint(filters: &[serde_json::Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::Value::Array(filters.to_vec())
+        .to_string()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Blocks and logs of one scanned range.
 pub struct Scanned {
     /// Every block with a matched log, and the last block of the range (possibly without logs).
@@ -732,8 +760,11 @@ impl DatalakeClient {
     /// Scans `[from, to]` for the logs of `filter`. Returns `Ok(None)` when the datalake cannot
     /// serve the range (not ingested yet, or a filter it cannot express); the caller then uses
     /// JSON-RPC. The scan may stop early (the answer was paged); `Scanned::to` says where.
+    ///
+    /// Each scan starts fetching the following range of the same size in the background, so
+    /// the next call usually finds its answer ready while the current one is processed.
     pub async fn scan(
-        &self,
+        self: &Arc<Self>,
         logger: &Logger,
         from: BlockNumber,
         to: BlockNumber,
@@ -752,7 +783,92 @@ impl DatalakeClient {
         let Some(filters) = log_filters(filter) else {
             return Ok(None);
         };
+        let key = fingerprint(&filters);
+        let filters = Arc::new(filters);
 
+        let prefetched = self.prefetched.lock().await.remove(&(key, from));
+        let scanned = match prefetched {
+            Some(handle) => match handle.await {
+                Ok(Ok(scanned)) => Some(scanned),
+                Ok(Err(e)) => {
+                    debug!(logger, "Prefetched datalake range failed, fetching again";
+                        "from" => from, "error" => format!("{e:#}"));
+                    None
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let scanned = match scanned {
+            Some(scanned) if scanned.to <= to => scanned,
+            Some(scanned) => self.trim(logger, scanned, to).await?,
+            None => self.fetch(logger, from, to, &filters).await?,
+        };
+
+        let next = scanned.to + 1;
+        if next <= height {
+            let size = to - from + 1;
+            let client = self.clone();
+            let logger = logger.clone();
+            let handle = tokio::spawn(async move {
+                client
+                    .fetch(&logger, next, (next + size - 1).min(height), &filters)
+                    .await
+            });
+            let mut prefetched = self.prefetched.lock().await;
+            // A filter change or restarted stream leaves stale entries behind; they are few
+            // and dropped here.
+            prefetched.retain(|(k, _), _| *k == key);
+            prefetched.insert((key, next), handle);
+        }
+        Ok(Some(scanned))
+    }
+
+    /// Cuts a prefetched scan back to end at `to`, which must then be in it.
+    async fn trim(
+        &self,
+        logger: &Logger,
+        mut scanned: Scanned,
+        to: BlockNumber,
+    ) -> anyhow::Result<Scanned> {
+        let last = u64::try_from(to).expect("block numbers are positive");
+        scanned
+            .blocks
+            .retain(|(block, _)| block.number_u64() <= last);
+        if scanned.blocks.last().map(|(b, _)| b.number_u64()) != Some(last) {
+            let mut headers = self.header(logger, to).await?;
+            let (header, uncles) = headers
+                .remove(&last)
+                .ok_or_else(|| anyhow!("datalake has no block {to}"))?;
+            scanned
+                .blocks
+                .push((Arc::new(block(header, uncles, vec![])), vec![]));
+        }
+        scanned.to = to;
+        Ok(scanned)
+    }
+
+    async fn header(
+        &self,
+        logger: &Logger,
+        number: BlockNumber,
+    ) -> anyhow::Result<BTreeMap<u64, (Header<AnyHeader>, Vec<B256>)>> {
+        let body = serde_json::json!({
+            "fromBlock": number,
+            "toBlock": number,
+            "fields": { "block": field_map(BLOCK_FIELDS) },
+        });
+        headers(&self.query(logger, &body).await?.blocks)
+    }
+
+    /// One scan of `[from, to]` (possibly ending early when the datalake pages the answer).
+    async fn fetch(
+        &self,
+        logger: &Logger,
+        from: BlockNumber,
+        to: BlockNumber,
+        filters: &[serde_json::Value],
+    ) -> anyhow::Result<Scanned> {
         let mut blocks = BTreeMap::new();
         let mut txs = HashMap::new();
         let mut matched = Vec::new();
@@ -789,13 +905,7 @@ impl DatalakeClient {
         // when nothing matched there.
         let last = u64::try_from(covered).expect("block numbers are positive");
         if !blocks.contains_key(&last) {
-            let body = serde_json::json!({
-                "fromBlock": covered,
-                "toBlock": covered,
-                "fields": { "block": field_map(BLOCK_FIELDS) },
-            });
-            let answer = self.query(logger, &body).await?;
-            blocks.extend(headers(&answer.blocks)?);
+            blocks.extend(self.header(logger, covered).await?);
             if !blocks.contains_key(&last) {
                 return Err(anyhow!("datalake has no block {covered}"));
             }
@@ -813,21 +923,15 @@ impl DatalakeClient {
             .map(|(number, (header, uncles))| {
                 let mut transactions = txs.remove(&number).unwrap_or_default();
                 transactions.sort_by_key(|tx| tx.transaction_index);
-                let block: AnyBlock = Block {
-                    header,
-                    uncles,
-                    transactions: BlockTransactions::Full(transactions),
-                    withdrawals: None,
-                };
                 let logs = logs_by_block.remove(&number).unwrap_or_default();
-                (Arc::new(LightEthereumBlock::new(block)), logs)
+                (Arc::new(block(header, uncles, transactions)), logs)
             })
             .collect();
         debug!(logger, "Scanned blocks with the datalake"; "from" => from, "to" => covered);
-        Ok(Some(Scanned {
+        Ok(Scanned {
             blocks,
             to: covered,
-        }))
+        })
     }
 
     /// The canonical block pointer at `number`, if the datalake has it.

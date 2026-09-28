@@ -28,6 +28,10 @@ pub struct EnvVarsMapping {
     /// Set by the environment variable `GRAPH_RUNTIME_MAX_STACK_SIZE`
     /// (expressed in bytes). The default value is 512KiB.
     pub max_stack_size: usize,
+    /// Instances the shared WASM instance pool holds (`GRAPH_WASM_INSTANCE_POOL`, default
+    /// 1024); instantiating from a pool avoids mapping fresh memory for every trigger. `0`
+    /// allocates every instance on demand instead.
+    pub wasm_instance_pool: u32,
 
     /// Set by the environment variable `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`
     /// (expressed in bytes). The default value is 1MiB.
@@ -150,6 +154,7 @@ impl TryFrom<InnerMappingHandlers> for EnvVarsMapping {
             max_api_version: x.max_api_version,
             timeout: x.mapping_handler_timeout_in_secs.map(Duration::from_secs),
             max_stack_size: x.runtime_max_stack_size.0.0,
+            wasm_instance_pool: x.wasm_instance_pool,
 
             max_ipfs_cache_file_size: x.max_ipfs_cache_file_size.0,
             max_ipfs_cache_size: x.max_ipfs_cache_size,
@@ -181,6 +186,8 @@ pub struct InnerMappingHandlers {
     mapping_handler_timeout_in_secs: Option<u64>,
     #[envconfig(from = "GRAPH_RUNTIME_MAX_STACK_SIZE", default = "")]
     runtime_max_stack_size: WithDefaultUsize<NoUnderscores<usize>, { 512 * 1024 }>,
+    #[envconfig(from = "GRAPH_WASM_INSTANCE_POOL", default = "1024")]
+    wasm_instance_pool: u32,
 
     // IPFS.
     #[envconfig(from = "GRAPH_MAX_IPFS_CACHE_FILE_SIZE", default = "")]
