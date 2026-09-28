@@ -5,6 +5,7 @@ use futures::future::select_ok;
 use graph::blockchain::BlockchainKind;
 use graph::blockchain::client::ChainClient;
 use graph::components::network_provider::ChainName;
+use graph::prelude::BlockNumber;
 use graph::prelude::alloy::primitives::B256;
 use graph::slog::o;
 use graph::util::backoff::ExponentialBackoff;
@@ -17,6 +18,11 @@ use graph::{
     },
 };
 use std::{sync::Arc, time::Duration};
+
+/// Behind by more than this many blocks, the ingestor fetches ancestors concurrently.
+const BACKFILL_MIN_BLOCKS: BlockNumber = 8;
+/// Blocks fetched at once while backfilling.
+const BACKFILL_CONCURRENCY: usize = 32;
 
 pub struct PollingBlockIngestor {
     logger: Logger,
@@ -105,7 +111,7 @@ impl PollingBlockIngestor {
         }
 
         // Compare latest block with head ptr, alert user if far behind
-        match head_block_ptr_opt {
+        match head_block_ptr_opt.as_ref() {
             None => {
                 info!(
                     &logger,
@@ -135,6 +141,24 @@ impl PollingBlockIngestor {
                     );
                 }
             }
+        }
+
+        // Before the head pointer can move, the store needs the latest block's ancestors (up to
+        // `ancestor_count`). On a cold or far-behind store, fetch them concurrently by number
+        // first; the walk by parent hash below then finds them stored, and still checks that
+        // they link up (a block that changed in a reorg meanwhile is fetched again by hash).
+        let behind = match head_block_ptr_opt.as_ref() {
+            None => self.ancestor_count,
+            Some(head) => (latest_block.number - head.number).min(self.ancestor_count),
+        };
+        if behind > BACKFILL_MIN_BLOCKS {
+            self.backfill(
+                logger,
+                &eth_adapter,
+                latest_block.number - behind,
+                latest_block.number - 1,
+            )
+            .await?;
         }
 
         // Store latest block in block store.
@@ -167,6 +191,41 @@ impl PollingBlockIngestor {
             missing_block_hash = self.ingest_block(logger, &eth_adapter, &hash).await?;
         }
         Ok(())
+    }
+
+    /// Fetches and stores blocks `[from, to]` by number, `BACKFILL_CONCURRENCY` at a time.
+    async fn backfill(
+        &self,
+        logger: &Logger,
+        eth_adapter: &Arc<EthereumAdapter>,
+        from: BlockNumber,
+        to: BlockNumber,
+    ) -> Result<(), IngestorError> {
+        use graph::futures03::stream::{self, StreamExt, TryStreamExt};
+
+        debug!(logger, "Backfilling recent blocks"; "from" => from, "to" => to);
+        stream::iter(from.max(0)..=to)
+            .map(|number| async move {
+                let block = eth_adapter
+                    .block_by_number(logger, number)
+                    .await
+                    .map_err(IngestorError::Unknown)?
+                    .ok_or_else(|| {
+                        IngestorError::Unknown(anyhow::anyhow!("block {number} is not available"))
+                    })?;
+                let ethereum_block = eth_adapter.load_full_block(logger, block).await?;
+                let block = BlockFinality::NonFinal(EthereumBlockWithCalls {
+                    ethereum_block,
+                    calls: None,
+                });
+                self.chain_store
+                    .upsert_block(Arc::new(block))
+                    .await
+                    .map_err(IngestorError::Unknown)
+            })
+            .buffer_unordered(BACKFILL_CONCURRENCY)
+            .try_collect::<()>()
+            .await
     }
 
     async fn ingest_block(
