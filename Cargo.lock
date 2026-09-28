@@ -3935,6 +3935,7 @@ name = "graph-chain-ethereum"
 version = "0.45.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-trait",
  "base64",
  "envconfig",

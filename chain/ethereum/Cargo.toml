@@ -12,6 +12,7 @@ serde = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 anyhow = "1.0"
+arrow = { workspace = true }
 hex = "0.4.3"
 semver = { workspace = true }
 thiserror = { workspace = true }

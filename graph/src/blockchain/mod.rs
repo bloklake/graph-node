@@ -210,6 +210,12 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     fn is_refetch_block_required(&self) -> bool;
 
+    /// True when triggers for template data sources are cheaper to fetch by event alone
+    /// (static filters) than by restarting the block stream for every new data source.
+    fn prefers_static_filters(&self) -> bool {
+        false
+    }
+
     async fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)>;
 
     fn chain_client(&self) -> Arc<ChainClient<Self>>;

@@ -2605,6 +2605,22 @@ async fn get_logs_and_transactions(
     Ok(log_triggers)
 }
 
+/// Receipts of these transactions (by block hash), fetched over JSON-RPC.
+pub(crate) async fn receipts_for_transactions(
+    adapter: &Arc<EthereumAdapter>,
+    logger: &Logger,
+    subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
+    transaction_hashes_by_block: &HashMap<B256, HashSet<B256>>,
+) -> Result<HashMap<B256, Arc<AnyTransactionReceiptBare>>, anyhow::Error> {
+    get_transaction_receipts_for_transaction_hashes(
+        adapter,
+        transaction_hashes_by_block,
+        subgraph_metrics,
+        ProviderLogger::new(logger, adapter.provider()),
+    )
+    .await
+}
+
 /// Tries to retrive all transaction receipts for a set of transaction hashes.
 async fn get_transaction_receipts_for_transaction_hashes(
     adapter: &EthereumAdapter,

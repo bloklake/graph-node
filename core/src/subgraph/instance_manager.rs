@@ -506,6 +506,7 @@ impl<S: SubgraphStore, AC: amp::Client> SubgraphInstanceManager<S, AC> {
             subgraph_data_source_stores.clone(),
         ));
 
+        let static_filters = self.static_filters || chain.prefers_static_filters();
         let inputs = IndexingInputs {
             deployment: deployment.clone(),
             features,
@@ -520,7 +521,7 @@ impl<S: SubgraphStore, AC: amp::Client> SubgraphInstanceManager<S, AC> {
             chain,
             templates,
             unified_api_version,
-            static_filters: self.static_filters,
+            static_filters,
             poi_version,
             network: network.to_string(),
             instrument,

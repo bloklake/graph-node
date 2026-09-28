@@ -209,6 +209,9 @@ indexers = [ "default" ]
                 raise RuntimeError("timeout")
             time.sleep(0.05)
         t1 = time.monotonic()
+        if args.metrics:
+            (work / f"{args.case}{args.db_suffix}-{run_no}.metrics").write_bytes(
+                http(f"http://127.0.0.1:{ports['metrics']}/metrics"))
     finally:
         os.killpg(proc.pid, signal.SIGTERM)
         try:
@@ -230,6 +233,7 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=7200)
     ap.add_argument("--log-level", default="info")
+    ap.add_argument("--metrics", action="store_true", help="save the Prometheus metrics at the end")
     ap.add_argument("--port-base", type=int, default=18000)
     ap.add_argument("--cpus", default="0-7,10-31")
     ap.add_argument("--db-suffix", default="")

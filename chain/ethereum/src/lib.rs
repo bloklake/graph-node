@@ -4,6 +4,7 @@ mod call_helper;
 mod capabilities;
 pub mod codec;
 mod data_source;
+pub mod datalake;
 mod env;
 mod ethereum_adapter;
 mod ingestor;

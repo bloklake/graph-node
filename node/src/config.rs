@@ -758,6 +758,9 @@ pub struct ChainSettings {
     /// Defaults to `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`.
     #[serde(default = "default_genesis_block_number")]
     pub genesis_block_number: u64,
+    /// Historical log triggers from a datalake (`datalake = { url = "..." }`).
+    #[serde(default)]
+    pub datalake: Option<graph_chain_ethereum::datalake::DatalakeSettings>,
 }
 
 impl Default for ChainSettings {
@@ -775,6 +778,7 @@ impl Default for ChainSettings {
             block_ingestor_max_concurrent_json_rpc_calls:
                 default_block_ingestor_max_concurrent_json_rpc_calls(),
             genesis_block_number: default_genesis_block_number(),
+            datalake: None,
         }
     }
 }
