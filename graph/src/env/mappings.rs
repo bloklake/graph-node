@@ -36,6 +36,9 @@ pub struct EnvVarsMapping {
     /// (`GRAPH_SPECULATION_THREADS`, default 0 = off). A speculative run is kept only when
     /// nothing it read changed before its turn; its writes are then replayed in order.
     pub speculation_threads: usize,
+    /// Speculative handler runs in flight at most (`GRAPH_SPECULATION_CONCURRENCY`, default
+    /// 512); runs waiting on host calls count. Keep it below `GRAPH_WASM_INSTANCE_POOL`.
+    pub speculation_concurrency: usize,
 
     /// Set by the environment variable `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`
     /// (expressed in bytes). The default value is 1MiB.
@@ -160,6 +163,7 @@ impl TryFrom<InnerMappingHandlers> for EnvVarsMapping {
             max_stack_size: x.runtime_max_stack_size.0.0,
             wasm_instance_pool: x.wasm_instance_pool,
             speculation_threads: x.speculation_threads,
+            speculation_concurrency: x.speculation_concurrency,
 
             max_ipfs_cache_file_size: x.max_ipfs_cache_file_size.0,
             max_ipfs_cache_size: x.max_ipfs_cache_size,
@@ -195,6 +199,8 @@ pub struct InnerMappingHandlers {
     wasm_instance_pool: u32,
     #[envconfig(from = "GRAPH_SPECULATION_THREADS", default = "0")]
     speculation_threads: usize,
+    #[envconfig(from = "GRAPH_SPECULATION_CONCURRENCY", default = "512")]
+    speculation_concurrency: usize,
 
     // IPFS.
     #[envconfig(from = "GRAPH_MAX_IPFS_CACHE_FILE_SIZE", default = "")]

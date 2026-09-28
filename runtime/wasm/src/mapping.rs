@@ -184,41 +184,34 @@ pub(crate) fn registered_module(raw_module: &Arc<Vec<u8>>) -> Option<Arc<ValidMo
         .and_then(std::sync::Weak::upgrade)
 }
 
-type SpeculationJob = Box<dyn FnOnce() + Send>;
-
-/// The threads that run speculative handler executions for all modules
-/// (`GRAPH_SPECULATION_THREADS`); `None` when speculation is off.
-fn speculation_pool() -> Option<&'static std::sync::mpsc::Sender<SpeculationJob>> {
-    static POOL: std::sync::OnceLock<Option<std::sync::mpsc::Sender<SpeculationJob>>> =
-        std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = ENV_VARS.mappings.speculation_threads;
-        if threads == 0 {
-            return None;
-        }
-        let (sender, receiver) = std::sync::mpsc::channel::<SpeculationJob>();
-        let receiver = Arc::new(std::sync::Mutex::new(receiver));
-        for i in 0..threads {
-            let receiver = receiver.clone();
-            thread::Builder::new()
-                .name(format!("speculation-{i:0>3}"))
-                .spawn(move || {
-                    loop {
-                        let job = receiver.lock().unwrap().recv();
-                        match job {
-                            Ok(job) => job(),
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("spawning a speculation thread");
-        }
-        Some(sender)
-    })
-    .as_ref()
+/// The runtime speculative handler runs execute on (`GRAPH_SPECULATION_THREADS` workers), and
+/// the limit on how many are in flight (`GRAPH_SPECULATION_CONCURRENCY`). Runs are tasks, not
+/// threads: a run waiting on a host call (an `eth_call`, say) yields its worker, so many can
+/// wait at once while only a few execute. `None` when speculation is off.
+fn speculation_runtime() -> Option<&'static (tokio::runtime::Runtime, Arc<tokio::sync::Semaphore>)>
+{
+    static RUNTIME: std::sync::OnceLock<
+        Option<(tokio::runtime::Runtime, Arc<tokio::sync::Semaphore>)>,
+    > = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let threads = ENV_VARS.mappings.speculation_threads;
+            if threads == 0 {
+                return None;
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .thread_name("speculation")
+                .enable_all()
+                .build()
+                .expect("building the speculation runtime");
+            let permits = ENV_VARS.mappings.speculation_concurrency.max(1);
+            Some((runtime, Arc::new(tokio::sync::Semaphore::new(permits))))
+        })
+        .as_ref()
 }
 
-/// Runs `trigger` against `ctx` on a speculation thread and delivers the resulting block state.
+/// Runs `trigger` against `ctx` as a speculative task and delivers the resulting block state.
 /// `None` when speculation is off.
 pub(crate) fn speculate<C: Blockchain>(
     valid_module: Arc<ValidModule>,
@@ -230,12 +223,13 @@ pub(crate) fn speculate<C: Blockchain>(
 where
     <C as Blockchain>::MappingTrigger: ToAscPtr,
 {
-    let pool = speculation_pool()?;
-    let runtime = tokio::runtime::Handle::current();
+    let (runtime, permits) = speculation_runtime()?;
+    let permits = permits.clone();
     let (sender, receiver) = graph::futures03::channel::oneshot::channel();
-    let job: SpeculationJob = Box::new(move || {
-        let _runtime_guard = runtime.enter();
-        let logger = ctx.logger.cheap_clone();
+    runtime.spawn(async move {
+        let Ok(_permit) = permits.acquire_owned().await else {
+            return;
+        };
         let run = async move {
             let module = WasmInstance::from_valid_module_with_ctx(
                 valid_module,
@@ -250,17 +244,16 @@ where
                 .await
                 .map(|(state, _gas)| state)
         };
-        let result =
-            panic::catch_unwind(AssertUnwindSafe(|| graph::block_on(run))).unwrap_or_else(|_| {
+        let result = graph::futures03::FutureExt::catch_unwind(AssertUnwindSafe(run))
+            .await
+            .unwrap_or_else(|_| {
                 Err(MappingError::Unknown(anyhow!(
                     "speculative handler run panicked"
                 )))
             });
-        if sender.send(result).is_err() {
-            trace!(logger, "Speculative result no longer wanted");
-        }
+        // The runner may have dropped the run (a revert, say).
+        let _ = sender.send(result);
     });
-    pool.send(job).ok()?;
     Some(receiver)
 }
 
