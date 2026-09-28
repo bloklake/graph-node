@@ -143,6 +143,7 @@ async fn process_record_batch_group<AC>(
         modifications,
         entity_lfu_cache,
         evict_stats: _,
+        complete: _,
     } = entity_cache
         .as_modifications(block_number.compat(), &cx.metrics.stopwatch)
         .await

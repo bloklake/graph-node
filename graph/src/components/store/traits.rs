@@ -447,6 +447,12 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// The maximum assigned causality region. Any higher number is therefore free to be assigned.
     async fn causality_region_curr_val(&self) -> Result<Option<CausalityRegion>, StoreError>;
 
+    /// Whether the deployment has any live entity. `false` means every entity lookup would
+    /// find nothing, which lets the entity cache answer misses without the store.
+    async fn has_entities(&self) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
     /// Report the name of the shard in which the subgraph is stored. This
     /// should only be used for reporting and monitoring
     fn shard(&self) -> &str;

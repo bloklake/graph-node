@@ -1522,6 +1522,12 @@ impl DeploymentStore {
         crate::dynds::causality_region_curr_val(&mut conn, &site).await
     }
 
+    /// Number of live entities of the deployment (`subgraphs.head.entity_count`).
+    pub(crate) async fn entity_count(&self, site: Arc<Site>) -> Result<usize, StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        crate::detail::entity_count(&mut conn, &site).await
+    }
+
     pub(crate) async fn exists_and_synced(&self, id: DeploymentHash) -> Result<bool, StoreError> {
         let mut conn = self.pool.get_permitted().await?;
         deployment::exists_and_synced(&mut conn, &id).await

@@ -108,6 +108,7 @@ where
                     env_vars.subgraph_error_retry_jitter,
                 ),
                 entity_lfu_cache: LfuCache::new(),
+                entity_cache_complete: false,
                 cached_head_ptr: None,
                 postponed_indexes_created: false,
             },
@@ -129,6 +130,7 @@ where
     /// duplicated host insertion and POI issues with dirty entity changes.
     fn revert_state_to(&mut self, block_number: BlockNumber) {
         self.state.entity_lfu_cache = LfuCache::new();
+        self.state.entity_cache_complete = false;
 
         // 1. Revert all hosts(created by DDS) at a block higher than `block_number`.
         // 2. Unmark any offchain data sources that were marked done on the blocks being removed.
@@ -481,6 +483,17 @@ where
     /// - `Reverting` → `AwaitingBlock` or `Restarting`
     /// - `Stopped` → terminal (returns)
     async fn run_inner(mut self, break_on_restart: bool) -> Result<Self, SubgraphRunnerError> {
+        // A deployment without live entities (typically one that has not processed a block
+        // yet) can have every entity it reads pass through the entity cache first. A fork reads
+        // entities from elsewhere, so it never qualifies.
+        self.state.entity_cache_complete = self.inputs.debug_fork.is_none()
+            && !self
+                .inputs
+                .store
+                .has_entities()
+                .await
+                .map_err(|e| SubgraphRunnerError::Unknown(e.into()))?;
+
         // Start in Initializing state
         self.runner_state = RunnerState::Initializing;
 
@@ -691,6 +704,7 @@ where
             modifications: mut mods,
             entity_lfu_cache: cache,
             evict_stats,
+            complete,
         } = entity_cache
             .as_modifications(block_ptr.number, &self.metrics.host.stopwatch)
             .await
@@ -704,6 +718,7 @@ where
         // Put the cache back in the state, asserting that the placeholder cache was not used.
         assert!(self.state.entity_lfu_cache.is_empty());
         self.state.entity_lfu_cache = cache;
+        self.state.entity_cache_complete = complete;
 
         if !mods.is_empty() {
             info!(&logger, "Applying {} entity operation(s)", mods.len());
@@ -1097,6 +1112,9 @@ where
             std::mem::take(&mut self.state.entity_lfu_cache),
             vid_gen,
         );
+        block_state
+            .entity_cache
+            .mark_complete(self.state.entity_cache_complete);
 
         let _section = self
             .metrics
