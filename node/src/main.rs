@@ -7,6 +7,11 @@ use tokio_util::sync::CancellationToken;
 
 git_testament!(TESTAMENT);
 
+// Mapping and speculation threads allocate heavily and concurrently; mimalloc keeps them from
+// contending on the system allocator's arena locks.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 lazy_static! {
     pub static ref MAX_BLOCKING_THREADS: usize = std::env::var("GRAPH_MAX_BLOCKING_THREADS")
         .ok()

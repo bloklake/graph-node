@@ -13,6 +13,7 @@ name = "graphman"
 path = "src/bin/manager.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
 clap.workspace = true

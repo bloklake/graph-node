@@ -978,13 +978,13 @@ where
             };
             if let Some(specs) = specs {
                 proof_of_indexing.start_handler(causality_region);
-                for (hosted, spec) in hosted_triggers.iter().zip(specs) {
-                    speculation::replay::<C, _>(
+                for spec in specs {
+                    speculation::replay(
                         &self.logger,
-                        hosted.host,
                         spec,
                         &mut state,
                         proof_of_indexing,
+                        causality_region,
                     )
                     .await
                     .map_err(|e| e.add_trigger_context(&trigger))?;
@@ -1043,42 +1043,137 @@ where
             return;
         };
         let snapshot = self.inputs.store.block_ptr().map_or(-1, |ptr| ptr.number);
+        let region = PoICausalityRegion::from_network(&self.inputs.network);
         let ptr = block.ptr();
         let chain_block = Arc::new(block.block.clone());
         let triggers = std::mem::take(&mut block.trigger_data);
+        // Whether every (trigger, host) match got a run, so the runner can skip matching.
+        let mut complete = true;
+        let mut launched = Vec::with_capacity(triggers.len());
         for (i, trigger) in triggers.into_iter().enumerate() {
             let data = match trigger {
                 Trigger::Chain(t) => TriggerData::Onchain(t),
                 Trigger::Subgraph(t) => TriggerData::Subgraph(t),
             };
+            let mut hosts = Vec::new();
             if matches!(data, TriggerData::Onchain(_)) {
                 for host in self.ctx.instance.hosts_for_trigger(&data) {
-                    let Ok(Some(mapping_trigger)) =
-                        host.match_and_decode(&data, &chain_block, &self.logger)
-                    else {
+                    let mapping_trigger =
+                        match host.match_and_decode(&data, &chain_block, &self.logger) {
+                            Ok(Some(mapping_trigger)) => mapping_trigger,
+                            Ok(None) => continue,
+                            Err(_) => {
+                                complete = false;
+                                continue;
+                            }
+                        };
+                    if host.poi_causality_region() != Some(region.as_str()) {
+                        complete = false;
                         continue;
-                    };
+                    }
                     let mut state = BlockState::new(
                         self.inputs.store.clone(),
                         LfuCache::new(),
                         SeqGenerator::new(ptr.number),
                     );
                     state.speculation = Some(Default::default());
-                    if let Some(result) = host.speculate(&self.logger, mapping_trigger, state) {
-                        speculations.insert(
-                            (ptr.hash.clone(), i, speculation::host_id(host)),
-                            snapshot,
-                            result,
-                        );
+                    match host.speculate(&self.logger, mapping_trigger, state) {
+                        Some(result) => {
+                            let id = speculation::host_id(host);
+                            speculations.insert((ptr.hash.clone(), i, id), snapshot, result);
+                            hosts.push(id);
+                        }
+                        None => complete = false,
                     }
                 }
+            } else {
+                complete = false;
             }
+            launched.push(hosts);
             block.trigger_data.push(match data {
                 TriggerData::Onchain(t) => Trigger::Chain(t),
                 TriggerData::Subgraph(t) => Trigger::Subgraph(t),
                 TriggerData::Offchain(_) => unreachable!("block triggers are never offchain"),
             });
         }
+        if complete {
+            speculations.launched(
+                ptr.hash,
+                speculation::LaunchedBlock {
+                    generation: self.ctx.instance.hosts_generation(),
+                    hosts: launched,
+                },
+            );
+        }
+    }
+
+    /// Runs a block's triggers from their speculative runs, matched to hosts when the runs were
+    /// launched (the host set has not changed since). A trigger without usable runs is matched,
+    /// decoded and run normally.
+    async fn execute_speculated(
+        &self,
+        logger: &Logger,
+        block: &Arc<C::Block>,
+        triggers: Vec<Trigger<C>>,
+        launched: speculation::LaunchedBlock,
+        block_state: BlockState,
+        proof_of_indexing: &SharedProofOfIndexing,
+        causality_region: &str,
+    ) -> Result<BlockState, MappingError> {
+        let speculations = self
+            .speculations
+            .as_ref()
+            .expect("launched blocks exist only with speculation on");
+        let hash = block.ptr().hash;
+        let mut state = block_state;
+        for ((i, trigger), hosts) in triggers.into_iter().enumerate().zip(launched.hosts) {
+            if hosts.is_empty() {
+                // No host matched the trigger.
+                continue;
+            }
+            let keys = hosts.iter().map(|id| (hash.clone(), i, *id));
+            let specs = match speculations.take_all(keys) {
+                Some(pending) => speculations.resolve(pending, &state).await,
+                None => None,
+            };
+            if let Some(specs) = specs {
+                proof_of_indexing.start_handler(causality_region);
+                for spec in specs {
+                    speculation::replay(
+                        logger,
+                        spec,
+                        &mut state,
+                        proof_of_indexing,
+                        causality_region,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            for runnable in self.match_triggers(logger, block, vec![trigger]).await? {
+                let RunnableTriggers {
+                    trigger,
+                    hosted_triggers,
+                } = runnable;
+                state = self
+                    .ctx
+                    .trigger_processor
+                    .process_trigger(
+                        logger,
+                        hosted_triggers,
+                        block,
+                        state,
+                        proof_of_indexing,
+                        causality_region,
+                        &self.inputs.debug_fork,
+                        &self.metrics.subgraph,
+                        self.inputs.instrument,
+                    )
+                    .await
+                    .map_err(|e| e.add_trigger_context(&trigger))?;
+            }
+        }
+        Ok(state)
     }
 
     /// Pipeline Stage 3: Process dynamically created data sources.
@@ -1277,22 +1372,46 @@ where
             .stopwatch
             .start_section(PROCESS_TRIGGERS_SECTION_NAME);
 
-        // Stage 1: Match triggers to hosts and decode
-        let runnables = self.match_triggers(&logger, &block, triggers).await;
+        // A block whose triggers all have speculative runs, matched to the same hosts as now,
+        // needs no matching and decoding.
+        let launched = self
+            .speculations
+            .as_ref()
+            .and_then(|speculations| speculations.take_launched(&block_ptr.hash))
+            .filter(|launched| launched.generation == self.ctx.instance.hosts_generation());
 
-        // Stage 2: Execute triggers
-        let res = match runnables {
-            Ok(runnables) => {
-                self.execute_triggers(
+        let res = match launched {
+            Some(launched) => {
+                self.execute_speculated(
+                    &logger,
                     &block,
-                    runnables,
+                    triggers,
+                    launched,
                     block_state,
                     &proof_of_indexing,
                     &causality_region,
                 )
                 .await
             }
-            Err(e) => Err(e),
+            None => {
+                // Stage 1: Match triggers to hosts and decode
+                let runnables = self.match_triggers(&logger, &block, triggers).await;
+
+                // Stage 2: Execute triggers
+                match runnables {
+                    Ok(runnables) => {
+                        self.execute_triggers(
+                            &block,
+                            runnables,
+                            block_state,
+                            &proof_of_indexing,
+                            &causality_region,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
 
         match res {

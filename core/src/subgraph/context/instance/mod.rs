@@ -43,6 +43,10 @@ pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
     /// buffer keeps its address from being reused for other bytes.
     module_hashes: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])>,
 
+    /// Changes whenever hosts are added or removed, so callers can tell that matching a
+    /// trigger against the hosts would give the same result as before.
+    hosts_generation: u64,
+
     /// This manages the sequence of causality regions for the subgraph.
     causality_region_seq: CausalityRegionSeq,
 }
@@ -92,6 +96,7 @@ where
             offchain_hosts: OffchainHosts::new(),
             module_cache: HashMap::new(),
             module_hashes: HashMap::new(),
+            hosts_generation: 0,
             templates,
             host_metrics,
             causality_region_seq,
@@ -165,6 +170,7 @@ where
         let Some(host) = self.new_host(logger.clone(), data_source)? else {
             return Ok(None);
         };
+        self.hosts_generation += 1;
 
         // Check for duplicates and add the host.
         match host.data_source() {
@@ -213,6 +219,7 @@ where
         &mut self,
         reverted_block: BlockNumber,
     ) -> Vec<offchain::Source> {
+        self.hosts_generation += 1;
         self.revert_onchain_hosts(reverted_block);
         self.offchain_hosts.remove_ge_block(reverted_block);
 
@@ -269,6 +276,10 @@ where
 
     pub(super) fn causality_region_next_value(&mut self) -> CausalityRegion {
         self.causality_region_seq.next_val()
+    }
+
+    pub fn hosts_generation(&self) -> u64 {
+        self.hosts_generation
     }
 
     pub fn hosts_len(&self) -> usize {

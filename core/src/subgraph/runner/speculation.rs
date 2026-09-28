@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use graph::blockchain::BlockHash;
 use graph::components::subgraph::{
-    MappingError, ProofOfIndexingEvent, RuntimeHost, SharedProofOfIndexing, SpeculativeOp,
+    MappingError, ProofOfIndexingEvent, SharedProofOfIndexing, SpeculativeOp,
 };
 use graph::futures03::channel::oneshot;
 use graph::prelude::{BlockNumber, BlockState, EntityModification};
@@ -43,9 +43,19 @@ pub(super) struct Pending {
     result: oneshot::Receiver<Result<BlockState, MappingError>>,
 }
 
+/// Which hosts each trigger of a read-ahead block was matched to when its runs were launched.
+pub(super) struct LaunchedBlock {
+    /// `SubgraphInstance::hosts_generation` at launch; while it is unchanged, matching the
+    /// block's triggers again would give the same hosts.
+    pub generation: u64,
+    /// Per trigger, the hosts it matched, in order; every one has a pending run.
+    pub hosts: Vec<Vec<usize>>,
+}
+
 #[derive(Default)]
 struct Inner {
     pending: HashMap<Key, Pending>,
+    blocks: HashMap<BlockHash, LaunchedBlock>,
     /// The last block in which each entity (type) was written, for blocks the runner processed
     /// while speculative runs may have been reading older state.
     written: HashMap<EntityKey, BlockNumber>,
@@ -80,6 +90,14 @@ impl Speculations {
             .insert(key, Pending { snapshot, result });
     }
 
+    pub(super) fn launched(&self, hash: BlockHash, block: LaunchedBlock) {
+        self.inner.lock().unwrap().blocks.insert(hash, block);
+    }
+
+    pub(super) fn take_launched(&self, hash: &BlockHash) -> Option<LaunchedBlock> {
+        self.inner.lock().unwrap().blocks.remove(hash)
+    }
+
     /// Takes the runs of all `keys`, or none of them when any is missing.
     pub(super) fn take_all(&self, keys: impl Iterator<Item = Key>) -> Option<Vec<Pending>> {
         let mut inner = self.inner.lock().unwrap();
@@ -90,6 +108,7 @@ impl Speculations {
     pub(super) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.pending.clear();
+        inner.blocks.clear();
         inner.written.clear();
         inner.written_types.clear();
     }
@@ -169,24 +188,18 @@ impl Speculations {
 }
 
 /// Applies a speculative run's effects to `state` the way running the handler would have.
-pub(super) async fn replay<C, H>(
+/// `region` is the proof of indexing causality region the handler's host writes to.
+pub(super) async fn replay(
     logger: &Logger,
-    host: &H,
     mut spec: BlockState,
     state: &mut BlockState,
     proof_of_indexing: &SharedProofOfIndexing,
-) -> Result<(), MappingError>
-where
-    C: graph::blockchain::Blockchain,
-    H: RuntimeHost<C> + ?Sized,
-{
+    region: &str,
+) -> Result<(), MappingError> {
     let log = spec
         .speculation
         .take()
         .expect("speculative runs carry a speculation log");
-    let region = host
-        .poi_causality_region()
-        .expect("hosts that speculate have a causality region");
 
     state.enter_handler();
     for op in log.ops {
