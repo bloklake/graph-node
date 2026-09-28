@@ -17,6 +17,7 @@ mod chain_head_listener;
 mod chain_store;
 mod content_store;
 mod copy;
+mod copy_insert;
 mod deployment;
 mod deployment_store;
 mod detail;

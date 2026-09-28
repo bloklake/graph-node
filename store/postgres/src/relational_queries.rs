@@ -2471,7 +2471,7 @@ impl<'a> InsertQuery<'a> {
     }
 
     /// Build the column name list using the subset of all keys among present entities.
-    fn unique_columns(table: &'a Table, rows: &'a WriteChunk<'a>) -> Vec<&'a Column> {
+    pub(crate) fn unique_columns(table: &'a Table, rows: &'a WriteChunk<'a>) -> Vec<&'a Column> {
         table
             .columns
             .iter()

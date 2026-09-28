@@ -24,6 +24,7 @@ members = [
     "tests",
     "graph/derive",
 ]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.45.0"
@@ -135,6 +136,10 @@ tokio-util = "0.7.15"
 [workspace.lints.clippy]
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+[patch.crates-io]
+# `raw_client`, for `COPY` (see `vendor/diesel-async/src/pg/mod.rs`).
+diesel-async = { path = "vendor/diesel-async" }
 
 [profile.release]
 opt-level = 's'

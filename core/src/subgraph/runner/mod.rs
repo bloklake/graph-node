@@ -1836,9 +1836,10 @@ where
         // iteration of loop. If the deployment head has caught up to the `cached_head_ptr`, update
         // it so that we are up to date when checking if synced.
         let cached_head_ptr = self.state.cached_head_ptr.cheap_clone();
-        if cached_head_ptr.is_none()
-            || close_to_chain_head(block_ptr, &cached_head_ptr, CAUGHT_UP_DISTANCE)
-        {
+        if cached_head_ptr.is_none() {
+            // Until the chain has a head, asking for every block costs a query each.
+            self.state.cached_head_ptr = self.recent_head_ptr().await?;
+        } else if close_to_chain_head(block_ptr, &cached_head_ptr, CAUGHT_UP_DISTANCE) {
             self.state.cached_head_ptr = self.inputs.chain.chain_head_ptr().await?;
         }
         let is_caught_up =

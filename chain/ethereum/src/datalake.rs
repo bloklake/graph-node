@@ -96,8 +96,9 @@ pub struct DatalakeClient {
     settings: DatalakeSettings,
     http: reqwest::Client,
     height: Mutex<Option<(Instant, Heights)>>,
-    /// Scans started ahead of time, by filter fingerprint and first block.
-    prefetched: Mutex<HashMap<(u64, BlockNumber), JoinHandle<anyhow::Result<Scanned>>>>,
+    /// Scans started ahead of time, by filter fingerprint and first block, with the last block
+    /// they were asked for.
+    prefetched: Mutex<HashMap<(u64, BlockNumber), Prefetched>>,
     /// The last scans' logs, to answer re-scans of single blocks (for data sources created in
     /// the block) without a request.
     recent: std::sync::Mutex<std::collections::VecDeque<RecentScan>>,
@@ -111,7 +112,9 @@ struct RecentScan {
 }
 
 /// Ranges fetched ahead of the stream.
-const PREFETCH_DEPTH: BlockNumber = 3;
+const PREFETCH_DEPTH: BlockNumber = 5;
+
+type Prefetched = (BlockNumber, JoinHandle<anyhow::Result<Scanned>>);
 
 /// Scans remembered for `recent_logs`.
 const RECENT_SCANS: usize = 8;
@@ -838,8 +841,14 @@ impl DatalakeClient {
         let filters = Arc::new(filters);
 
         let prefetched = self.prefetched.lock().await.remove(&(key, from));
+        let waited = std::time::Instant::now();
         let scanned = match prefetched {
-            Some(handle) => match handle.await {
+            Some((_, handle)) => match handle.await.inspect(|_| {
+                let ms = waited.elapsed().as_millis();
+                if ms > 0 {
+                    debug!(logger, "Waited for a prefetched datalake range"; "from" => from, "ms" => ms);
+                }
+            }) {
                 Ok(Ok(scanned)) => Some(scanned),
                 Ok(Err(e)) => {
                     debug!(logger, "Prefetched datalake range failed, fetching again";
@@ -856,12 +865,33 @@ impl DatalakeClient {
                 // Keep the part beyond `to` as the next range's answer.
                 let (head, rest) = self.split(logger, scanned, to).await?;
                 if let Some(rest) = rest {
+                    let end = rest.to;
                     let handle = tokio::spawn(async move { Ok(rest) });
-                    self.prefetched.lock().await.insert((key, to + 1), handle);
+                    self.prefetched
+                        .lock()
+                        .await
+                        .insert((key, to + 1), (end, handle));
                 }
                 head
             }
-            None => self.fetch(logger, from, to, &filters).await?,
+            None => {
+                debug!(logger, "Datalake range not prefetched"; "from" => from, "to" => to);
+                // Start on the next ranges now rather than after this one (at the stream's
+                // start, say): sized like this one until there is a density to go by.
+                if to < height {
+                    let mut prefetched = self.prefetched.lock().await;
+                    self.plan_prefetch(
+                        logger,
+                        &mut prefetched,
+                        key,
+                        &filters,
+                        to + 1,
+                        to - from + 1,
+                        height,
+                    );
+                }
+                self.fetch(logger, from, to, &filters).await?
+            }
         };
 
         let next = scanned.to + 1;
@@ -884,27 +914,44 @@ impl DatalakeClient {
             // A filter change or restarted stream leaves stale entries behind; they are few
             // and dropped here.
             prefetched.retain(|(k, start), _| *k == key && *start >= next);
-            // Keep several ranges in flight: fetching and decoding a dense range can take as
-            // long as indexing one.
-            for depth in 0..PREFETCH_DEPTH {
-                let start = next + depth * size;
-                if start > height {
-                    break;
-                }
-                if prefetched.contains_key(&(key, start)) {
-                    continue;
-                }
-                let client = self.clone();
-                let logger = logger.clone();
-                let filters = filters.clone();
-                let end = (start + size - 1).min(height);
-                let handle =
-                    tokio::spawn(async move { client.fetch(&logger, start, end, &filters).await });
-                prefetched.insert((key, start), handle);
-            }
+            self.plan_prefetch(logger, &mut prefetched, key, &filters, next, size, height);
         }
         self.remember(from, &scanned, filter);
         Ok(Some(scanned))
+    }
+
+    /// Keeps `PREFETCH_DEPTH` ranges from `next` on in flight: fetching and decoding a dense
+    /// range can take as long as indexing one. New ranges of `size` blocks continue from the
+    /// ones already in flight, so they do not overlap them.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_prefetch(
+        self: &Arc<Self>,
+        logger: &Logger,
+        prefetched: &mut HashMap<(u64, BlockNumber), Prefetched>,
+        key: u64,
+        filters: &Arc<Vec<serde_json::Value>>,
+        next: BlockNumber,
+        size: BlockNumber,
+        height: BlockNumber,
+    ) {
+        let mut start = next;
+        for _ in 0..PREFETCH_DEPTH {
+            if start > height {
+                break;
+            }
+            if let Some((end, _)) = prefetched.get(&(key, start)) {
+                start = end + 1;
+                continue;
+            }
+            let client = self.clone();
+            let logger = logger.clone();
+            let filters = filters.clone();
+            let end = (start + size.max(1) - 1).min(height);
+            let handle =
+                tokio::spawn(async move { client.fetch(&logger, start, end, &filters).await });
+            prefetched.insert((key, start), (end, handle));
+            start = end + 1;
+        }
     }
 
     fn remember(&self, from: BlockNumber, scanned: &Scanned, filter: &TriggerFilter) {
@@ -1006,6 +1053,7 @@ impl DatalakeClient {
         to: BlockNumber,
         filters: &[serde_json::Value],
     ) -> anyhow::Result<Scanned> {
+        let start = std::time::Instant::now();
         let mut blocks = BTreeMap::new();
         let mut txs = HashMap::new();
         let mut matched = Vec::new();
@@ -1064,7 +1112,8 @@ impl DatalakeClient {
                 (Arc::new(block(header, uncles, transactions)), logs)
             })
             .collect();
-        debug!(logger, "Scanned blocks with the datalake"; "from" => from, "to" => covered);
+        debug!(logger, "Scanned blocks with the datalake";
+            "from" => from, "to" => covered, "ms" => start.elapsed().as_millis());
         Ok(Scanned {
             blocks,
             to: covered,

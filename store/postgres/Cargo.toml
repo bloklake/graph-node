@@ -30,6 +30,8 @@ serde_json = { workspace = true }
 stable-hash_legacy = { git = "https://github.com/graphprotocol/stable-hash", rev = "42b85d936c6b9f1b7a4b8385d2f081d5564daa69", package = "stable-hash" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-postgres = "0.7.15"
+bytes = "1.11"
 anyhow = "1.0.102"
 git-testament = { workspace = true }
 itertools = "0.15.0"

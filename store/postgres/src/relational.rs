@@ -79,6 +79,7 @@ use graph::prelude::{
 use crate::ForeignServer;
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BoundSide, CAUSALITY_REGION_COLUMN};
 pub use crate::catalog::Catalog;
+use crate::copy_insert::CopyInsert;
 use crate::{AsyncPgConnection, catalog, deployment};
 
 use self::rollup::Rollup;
@@ -768,6 +769,7 @@ impl Layout {
         // not exceed the maximum number of bindings allowed in queries; tables
         // with scalar columns only are written with one array per column
         let unnest = UnnestInsertQuery::supports(table);
+        let copy = CopyInsert::supports(table);
         let chunk_size = if unnest {
             UnnestInsertQuery::CHUNK_SIZE
         } else {
@@ -779,12 +781,17 @@ impl Layout {
             // Empty chunks would lead to invalid SQL
             if !chunk.is_empty() {
                 expected_rows += chunk.len();
-                let result = match unnest
-                    .then(|| UnnestInsertQuery::new(table, &chunk))
-                    .flatten()
-                {
-                    Some(query) => query.execute(conn).await,
-                    None if unnest => {
+                let copy = copy.then(|| CopyInsert::new(table, &chunk)).flatten();
+                let unnest_query = match copy {
+                    Some(_) => None,
+                    None => unnest
+                        .then(|| UnnestInsertQuery::new(table, &chunk))
+                        .flatten(),
+                };
+                let result = match (copy, unnest_query) {
+                    (Some(copy), _) => copy.execute(conn).await,
+                    (None, Some(query)) => query.execute(conn).await,
+                    (None, None) if unnest => {
                         // Values `InsertQuery` handles or reports (the chunk may be larger
                         // than it takes at once).
                         let mut count = 0;
@@ -800,7 +807,7 @@ impl Layout {
                         }
                         result.map(|_| count)
                     }
-                    None => InsertQuery::new(table, &chunk)?.execute(conn).await,
+                    (None, None) => InsertQuery::new(table, &chunk)?.execute(conn).await,
                 };
                 match result {
                     Ok(count) => {
