@@ -864,11 +864,15 @@ impl Batch {
     /// healthy by setting `self.error` to `Some(_)` and must not be written
     /// as it will be in an indeterminate state.
     pub fn append(&mut self, batch: Batch) -> Result<(), StoreError> {
+        // The batch's weight only decides when it is flushed, so adding the appended batch's
+        // weight is enough; re-weighing every row after every block made a long batch
+        // quadratic to build.
+        let added = batch.indirect_weight;
         let res = self.append_inner(batch);
         if let Err(e) = &res {
             self.error = Some(e.clone());
         }
-        self.weigh();
+        self.indirect_weight += added;
         res
     }
 
