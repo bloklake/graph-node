@@ -96,6 +96,9 @@ pub struct SpeculationLog {
     pub related_types: Vec<EntityType>,
     /// The handler did something that cannot be replayed (generated an id, `ipfs.map`).
     pub unsupported: bool,
+    /// The handler asked the chain for something (`ethereum.call`, say). The answers are cached,
+    /// so running the handler again finds them even when the run itself cannot be replayed.
+    pub chain_calls: bool,
     /// The proof of indexing contributions of `ops`, in order, computed for the positions from
     /// `poi_start` on; empty if not computed.
     pub poi: Vec<crate::components::subgraph::PoiContribution>,

@@ -21,8 +21,10 @@ pub struct BufferedCallCache {
     buffer: Arc<Mutex<BlockBuffers>>,
 }
 
-/// Blocks whose call results stay buffered.
-const BUFFERED_BLOCKS: usize = 256;
+/// Blocks whose call results stay buffered. This covers the blocks the runner reads ahead of
+/// the one it processes (1,024), whose handlers run speculatively: when the runner has to run
+/// one of them again (an entity it read changed), its calls are answered from here.
+const BUFFERED_BLOCKS: usize = 2048;
 
 #[derive(Default)]
 struct BlockBuffers {

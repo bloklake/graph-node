@@ -406,6 +406,17 @@ fn build_engine() -> Result<wasmtime::Engine, anyhow::Error> {
 
     let slots = ENV_VARS.mappings.wasm_instance_pool;
     if slots > 0 {
+        // Every speculative run in flight holds an instance, and so do the runners' own runs;
+        // a pool smaller than that makes runs fail to start (and run again, one at a time).
+        let slots = if ENV_VARS.mappings.speculation_threads > 0 {
+            let wanted = ENV_VARS
+                .mappings
+                .speculation_concurrency
+                .saturating_add(256);
+            slots.max(u32::try_from(wanted).unwrap_or(u32::MAX))
+        } else {
+            slots
+        };
         let mut pool = wasmtime::PoolingAllocationConfig::default();
         pool.total_core_instances(slots)
             .total_memories(slots)

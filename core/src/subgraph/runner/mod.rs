@@ -343,8 +343,16 @@ where
         let event = match self.lookahead.pop_front() {
             Some(event) => event,
             None => {
-                let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
-                block_stream.next().await
+                let event = {
+                    let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
+                    block_stream.next().await
+                };
+                // Not read ahead (the first block, or the stream fell behind): its triggers
+                // still run side by side, rather than one after another on this thread.
+                if let Some(Ok(BlockStreamEvent::ProcessBlock(block, _))) = &event {
+                    self.speculate_block(block);
+                }
+                event
             }
         };
         self.read_ahead(&mut block_stream);

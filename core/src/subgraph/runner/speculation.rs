@@ -314,7 +314,9 @@ impl Speculations {
                     handler,
                 }) => {
                     let valid = self.valid(block, ready.snapshot, &spec, state);
-                    self.stats.judged(&handler, valid);
+                    // A run that asked the chain for something was worth it even when it is
+                    // stale: running the handler again finds the answers cached.
+                    self.stats.judged(&handler, valid || spec.log.chain_calls);
                     if !valid {
                         return None;
                     }

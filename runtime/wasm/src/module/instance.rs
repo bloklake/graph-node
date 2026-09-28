@@ -299,6 +299,9 @@ fn link_chain_host_fn(
                     let stopwatch = host_metrics.stopwatch.cheap_clone();
                     let _section = stopwatch.start_section(&section_name);
 
+                    if let Some(log) = caller.data_mut().ctx.state.speculation.as_mut() {
+                        log.chain_calls = true;
+                    }
                     let ctx = HostFnCtx {
                         logger: caller.data().ctx.logger.cheap_clone(),
                         block_ptr: caller.data().ctx.block_ptr.cheap_clone(),
