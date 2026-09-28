@@ -12,10 +12,10 @@ the end block indexed.
 
 | case | stock graph-node (launch) | fork (launch) | fork (deploy) | Ponder fork (launch) |
 |---|---|---|---|---|
-| USDC transfers, 790,560 events | 1,004 s | 14.6 s | 13.7 s | ~8 s |
-| rETH balances, 7,594 events | 54.5 s | 3.2 s | 2.4 s | ~1.5 s |
-| allowances, 19,125 events + 14,998 `eth_call`s at 200 ms | 2,930 s | 6.1 s | 5.3 s | ~3.2 s |
-| Safe factories, 82,268 data sources | 276.7 s | 5.2 s | 4.4 s | ~3 s |
+| USDC transfers, 790,560 events | 1,004 s | 8.9 s | 8.1 s | ~8 s |
+| rETH balances, 7,594 events | 54.5 s | 2.2 s | 1.4 s | ~1.5 s |
+| allowances, 19,125 events + 14,998 `eth_call`s at 200 ms | 2,930 s | 3.5 s | 2.8 s | ~3.2 s |
+| Safe factories, 82,268 data sources | 276.7 s | 3.2 s | 2.4 s | ~3 s |
 
 **Correctness:** each fork run's digest (every entity table plus `data_sources$`, rows alive or
 created at or before the end block, in id order; data sources in vid order) equals stock
@@ -29,8 +29,8 @@ answered for the parent block) and fixed: `BufferedCallCache` assumed one block 
 datalake = { url = "http://127.0.0.1:8084" }   # plus the usual providers
 ```
 ```
-GRAPH_SPECULATION_THREADS=12
-GRAPH_SPECULATION_CONCURRENCY=900
+GRAPH_SPECULATION_THREADS=16
+GRAPH_SPECULATION_CONCURRENCY=2000
 GRAPH_POSTPONE_ATTRIBUTE_INDEX_CREATION=true    # stock setting
 ```
 No `--ipfs`: subgraph files live in Postgres and `graph deploy --ipfs <admin url>` works as is.
@@ -56,22 +56,47 @@ No `--ipfs`: subgraph files live in Postgres and `graph deploy --ipfs <admin url
 9. **mimalloc**; lock-free AssemblyScript type ids; event signatures hashed once.
 10. **Inserts** — scalar-only tables written with one array per column (`unnest`).
 11. **Notifications** — batched for 20 ms instead of 500 ms (a new deployment started 0.5 s late).
-12. **`BufferedCallCache`** — results buffered per block (a correctness fix under concurrency).
+12. **`BufferedCallCache`** — results buffered per block (a correctness fix under concurrency),
+    for as many blocks as the runner reads ahead (2,048), so a handler the runner has to run
+    again finds its calls answered.
+13. **Marshalling** — AssemblyScript objects serialized without a vector per field or element.
+14. **Proof of indexing on the speculation threads** — the fast POI hash mixes its leaves in any
+    order, so each event's contribution is computed when its run finishes, for the position it
+    will take in the block; the runner mixes it in (or hashes normally if the position differs).
+15. **Logging** — records no drain would print are dropped before the async drain (it copied
+    every `trace!`/`debug!` record); the two per-block info lines are debug while syncing.
+16. **Head reads** — the chain head is read at most once a second for skipping empty blocks and
+    while the chain has no head yet (it was a query per block).
+17. **Datalake prefetch** — ranges in flight continue from each other instead of overlapping
+    (overlaps tripled the datalake's work); prefetching starts with the stream's first range;
+    five ranges ahead.
+18. **Binary `COPY`** for entity inserts of tables with scalar columns (not `BigDecimal`, not
+    skip-duplicates tables). `diesel-async` is vendored (`vendor/diesel-async`) to expose its
+    `tokio_postgres` client; nothing else in it changed.
+19. **Speculation fixes** — the WASM instance pool is at least the speculation concurrency plus
+    256 (at 1,024 instances runs failed to start and ran again one at a time); a block taken
+    straight from the stream (the first one, or after a stall) is speculated too; runs that
+    asked the chain count as useful even when stale, since their answers are cached.
 
 ## Where the remaining time goes
 
-- **USDC:** the runner is ~75% busy replaying (≈5 µs per trigger: proof of indexing hash and entity
-  cache write) and committing blocks (≈30 µs per block); the writer spends ~7 s inserting; the
-  speculative runs cost ~150 µs of CPU per trigger, most of it building the event's
-  AssemblyScript objects (a `Vec<u8>` per object, copied into WASM memory) and gas accounting.
-- **Small cases:** ~0.8 s of the launch time is graph-node start-up (≈0.5 s of it migrations on the
-  fresh database), which a long-running node does not pay per deployment.
+- **USDC:** the writer and the runner are both ~80% busy. The writer's `COPY`s take 2.7 s of
+  server time for `transfer_event` (the unique `id` index is the largest part) and 2.1 s for
+  `poi2$` (its GiST exclusion constraint); the runner replays at ~2 µs per trigger plus ~30 µs
+  per block.
+- **Allowances:** bounded by the eth_calls' 200 ms latency and how many are in flight
+  (`GRAPH_SPECULATION_CONCURRENCY`; 2,000–4,000 here).
+- **rETH:** stale runs re-run on the runner (balances change from block to block).
+- **Small cases:** ~1 s of the launch time is graph-node start-up (0.6 s migrations and 0.2 s
+  cross-shard views on the fresh database), which a long-running node does not pay per
+  deployment.
 
 ## Next
 
-1. Marshalling: write AssemblyScript objects straight into WASM memory; cheaper gas accounting.
-2. Replay: skip re-validating entities the speculative run validated; avoid per-event allocations
-   in the proof of indexing stream.
-3. Writer: binary `COPY` for inserts.
+1. Mutable tables: the `gist (id, block_range)` exclusion constraint costs 25–45 µs per insert
+   (`poi2$` is written every block); most of the writer's time on USDC after `COPY`.
+2. Runs made stale by earlier blocks (rETH balances) run again on the runner; ~98% of rETH
+   transfers.
+3. Start-up on a fresh database: migrations 0.6 s, cross-shard views 0.2 s.
 4. Tests for the new paths (content store, datalake conversion against JSON-RPC blocks, speculation
    validity rules), and operator docs.
