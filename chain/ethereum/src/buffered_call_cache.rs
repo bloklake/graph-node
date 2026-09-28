@@ -13,38 +13,56 @@ use graph::{
 };
 
 /// A wrapper around an Ethereum call cache that buffers call results in
-/// memory for the duration of a block. If `get_call` or `set_call` are
-/// called with a different block pointer than the one used in the previous
-/// call, the buffer is cleared.
+/// memory. Results are kept per block for the most recent blocks, so
+/// handlers of different blocks running at the same time (speculative
+/// execution) never see each other's results.
 pub struct BufferedCallCache {
     call_cache: Arc<dyn EthereumCallCache>,
-    buffer: Arc<Mutex<HashMap<call::Request, call::Retval>>>,
-    block: Arc<Mutex<Option<BlockPtr>>>,
+    buffer: Arc<Mutex<BlockBuffers>>,
+}
+
+/// Blocks whose call results stay buffered.
+const BUFFERED_BLOCKS: usize = 256;
+
+#[derive(Default)]
+struct BlockBuffers {
+    blocks: HashMap<BlockPtr, HashMap<call::Request, call::Retval>>,
+}
+
+impl BlockBuffers {
+    fn block(&mut self, block: &BlockPtr) -> &mut HashMap<call::Request, call::Retval> {
+        if !self.blocks.contains_key(block) && self.blocks.len() >= BUFFERED_BLOCKS {
+            // Drop the oldest block's results.
+            if let Some(oldest) = self.blocks.keys().min_by_key(|ptr| ptr.number).cloned() {
+                self.blocks.remove(&oldest);
+            }
+        }
+        self.blocks.entry(block.clone()).or_default()
+    }
 }
 
 impl BufferedCallCache {
     pub fn new(call_cache: Arc<dyn EthereumCallCache>) -> Self {
         Self {
             call_cache,
-            buffer: Arc::new(Mutex::new(HashMap::new())),
-            block: Arc::new(Mutex::new(None)),
+            buffer: Arc::new(Mutex::new(BlockBuffers::default())),
         }
     }
 
-    fn check_block(&self, block: &BlockPtr) {
-        let mut self_block = self.block.lock().unwrap();
-        if self_block.as_ref() != Some(block) {
-            *self_block = Some(block.clone());
-            self.buffer.lock().unwrap().clear();
-        }
-    }
-
-    fn get(&self, call: &call::Request) -> Option<call::Response> {
+    fn get(&self, call: &call::Request, block: &BlockPtr) -> Option<call::Response> {
         let buffer = self.buffer.lock().unwrap();
-        buffer.get(call).map(|retval| {
+        buffer.blocks.get(block)?.get(call).map(|retval| {
             call.cheap_clone()
                 .response(retval.clone(), call::Source::Memory)
         })
+    }
+
+    fn insert(&self, call: call::Request, block: &BlockPtr, retval: call::Retval) {
+        self.buffer
+            .lock()
+            .unwrap()
+            .block(block)
+            .insert(call, retval);
     }
 }
 
@@ -55,22 +73,19 @@ impl EthereumCallCache for BufferedCallCache {
         call: &call::Request,
         block: BlockPtr,
     ) -> Result<Option<call::Response>, graph::prelude::Error> {
-        self.check_block(&block);
-
-        if let Some(value) = self.get(call) {
+        if let Some(value) = self.get(call, &block) {
             return Ok(Some(value));
         }
 
-        let result = self.call_cache.get_call(call, block).await?;
+        let result = self.call_cache.get_call(call, block.clone()).await?;
 
-        let mut buffer = self.buffer.lock().unwrap();
         if let Some(call::Response {
             retval,
             req: _,
             source: _,
         }) = &result
         {
-            buffer.insert(call.cheap_clone(), retval.clone());
+            self.insert(call.cheap_clone(), &block, retval.clone());
         }
         Ok(result)
     }
@@ -80,25 +95,20 @@ impl EthereumCallCache for BufferedCallCache {
         reqs: &[call::Request],
         block: BlockPtr,
     ) -> Result<(Vec<call::Response>, Vec<call::Request>), graph::prelude::Error> {
-        self.check_block(&block);
-
         let mut missing = Vec::new();
         let mut resps = Vec::new();
 
         for call in reqs {
-            match self.get(call) {
+            match self.get(call, &block) {
                 Some(resp) => resps.push(resp),
                 None => missing.push(call.cheap_clone()),
             }
         }
 
-        let (stored, calls) = self.call_cache.get_calls(&missing, block).await?;
+        let (stored, calls) = self.call_cache.get_calls(&missing, block.clone()).await?;
 
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            for resp in &stored {
-                buffer.insert(resp.req.cheap_clone(), resp.retval.clone());
-            }
+        for resp in &stored {
+            self.insert(resp.req.cheap_clone(), &block, resp.retval.clone());
         }
 
         resps.extend(stored);
@@ -119,16 +129,11 @@ impl EthereumCallCache for BufferedCallCache {
         block: BlockPtr,
         return_value: call::Retval,
     ) -> Result<(), graph::prelude::Error> {
-        self.check_block(&block);
-
         // Enter the call into the in-memory cache immediately so that
         // handlers will find it, but add it to the underlying cache in the
         // background so we do not have to wait for that as it will be a
         // cache backed by the database
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            buffer.insert(call.cheap_clone(), return_value.clone());
-        }
+        self.insert(call.cheap_clone(), &block, return_value.clone());
 
         let cache = self.call_cache.cheap_clone();
         let logger = logger.cheap_clone();
