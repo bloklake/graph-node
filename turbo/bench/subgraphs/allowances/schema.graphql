@@ -1,0 +1,17 @@
+type ApprovalEvent @entity(immutable: true) {
+  id: Bytes!
+  token: Bytes!
+  owner: Bytes!
+  spender: Bytes!
+  approved: BigInt!
+  allowance: BigInt!
+  timestamp: Int!
+}
+
+type TokenAllowance @entity(immutable: false) {
+  id: Bytes!
+  token: Bytes!
+  owner: Bytes!
+  spender: Bytes!
+  allowance: BigInt!
+}

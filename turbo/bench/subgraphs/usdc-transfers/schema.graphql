@@ -1,0 +1,7 @@
+type TransferEvent @entity(immutable: true) {
+  id: Bytes!
+  from: Bytes!
+  to: Bytes!
+  amount: BigInt!
+  timestamp: Int!
+}

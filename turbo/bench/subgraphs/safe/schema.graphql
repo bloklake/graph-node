@@ -1,0 +1,23 @@
+type Safe @entity(immutable: true) {
+  id: Bytes!
+  proxy: Bytes!
+  singleton: Bytes!
+  timestamp: Int!
+}
+
+type SafeSetup @entity(immutable: true) {
+  id: Bytes!
+  proxy: Bytes!
+  initiator: Bytes!
+  threshold: BigInt!
+  timestamp: Int!
+}
+
+"Any other Safe event: its arguments as JSON (integers as decimal strings)."
+type SafeEvent @entity(immutable: true) {
+  id: Bytes!
+  proxy: Bytes!
+  name: String!
+  args: String!
+  timestamp: Int!
+}
