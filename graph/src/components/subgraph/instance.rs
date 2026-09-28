@@ -96,6 +96,10 @@ pub struct SpeculationLog {
     pub related_types: Vec<EntityType>,
     /// The handler did something that cannot be replayed (generated an id, `ipfs.map`).
     pub unsupported: bool,
+    /// The proof of indexing contributions of `ops`, in order, computed for the positions from
+    /// `poi_start` on; empty if not computed.
+    pub poi: Vec<crate::components::subgraph::PoiContribution>,
+    pub poi_start: u64,
 }
 
 #[derive(Debug)]

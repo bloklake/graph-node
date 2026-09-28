@@ -18,8 +18,8 @@ use std::sync::Mutex;
 
 use graph::blockchain::BlockHash;
 use graph::components::subgraph::{
-    MappingError, ProofOfIndexingEvent, SharedProofOfIndexing, SpeculativeOp, SpeculativeResult,
-    SpeculativeRun,
+    MappingError, PoiContribution, ProofOfIndexingEvent, SharedProofOfIndexing, SpeculativeOp,
+    SpeculativeResult, SpeculativeRun,
 };
 use graph::futures03::channel::oneshot;
 use graph::prelude::{BlockNumber, BlockState, EntityModification};
@@ -328,6 +328,52 @@ impl Speculations {
     }
 }
 
+/// The proof of indexing event a speculative write stands for.
+fn poi_event(op: &SpeculativeOp) -> ProofOfIndexingEvent<'_> {
+    match op {
+        SpeculativeOp::Set {
+            key,
+            entity,
+            poi_id,
+            ..
+        } => ProofOfIndexingEvent::SetEntity {
+            entity_type: key.entity_type.typename(),
+            id: poi_id,
+            data: entity,
+        },
+        SpeculativeOp::Remove {
+            poi_type, poi_id, ..
+        } => ProofOfIndexingEvent::RemoveEntity {
+            entity_type: poi_type,
+            id: poi_id,
+        },
+    }
+}
+
+/// Computes the proof of indexing contributions of a block's runs (`results`, in the order the
+/// runner replays them) for the positions their events take if every run is replayed. A run the
+/// runner does not replay shifts the positions after it; replay then writes those events
+/// normally.
+pub(super) fn precompute_poi(block: BlockNumber, results: &mut [(RunKey, RunResult)]) {
+    let mut position = 0;
+    for (_, result) in results {
+        let Ok(SpeculativeRun::Ran { result, .. }) = result else {
+            continue;
+        };
+        let log = &mut result.log;
+        log.poi_start = position;
+        log.poi = log
+            .ops
+            .iter()
+            .map(|op| {
+                let contribution = PoiContribution::new(block, position, &poi_event(op));
+                position += 1;
+                contribution
+            })
+            .collect();
+    }
+}
+
 /// Applies a speculative run's effects to `state` the way running the handler would have.
 /// `region` is the proof of indexing causality region the handler's host writes to.
 pub(super) async fn replay(
@@ -345,23 +391,20 @@ pub(super) async fn replay(
     } = spec;
 
     state.enter_handler();
-    for op in log.ops {
+    let mut position = log.poi_start;
+    for (i, op) in log.ops.into_iter().enumerate() {
+        let written = log
+            .poi
+            .get(i)
+            .is_some_and(|c| proof_of_indexing.write_contribution(region, position, c));
+        position += 1;
+        if !written {
+            proof_of_indexing.write_event(&poi_event(&op), region, logger);
+        }
         match op {
             SpeculativeOp::Set {
-                key,
-                entity,
-                poi_id,
-                valid,
+                key, entity, valid, ..
             } => {
-                proof_of_indexing.write_event(
-                    &ProofOfIndexingEvent::SetEntity {
-                        entity_type: key.entity_type.typename(),
-                        id: &poi_id,
-                        data: &entity,
-                    },
-                    region,
-                    logger,
-                );
                 if let Err(e) = state
                     .entity_cache
                     .set_validated(
@@ -378,19 +421,7 @@ pub(super) async fn replay(
                     ));
                 }
             }
-            SpeculativeOp::Remove {
-                key,
-                poi_type,
-                poi_id,
-            } => {
-                proof_of_indexing.write_event(
-                    &ProofOfIndexingEvent::RemoveEntity {
-                        entity_type: &poi_type,
-                        id: &poi_id,
-                    },
-                    region,
-                    logger,
-                );
+            SpeculativeOp::Remove { key, .. } => {
                 state.entity_cache.remove(key);
             }
         }

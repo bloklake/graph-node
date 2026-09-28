@@ -16,8 +16,8 @@ pub use self::instance::{
 };
 pub use self::instance_manager::SubgraphInstanceManager;
 pub use self::proof_of_indexing::{
-    PoICausalityRegion, ProofOfIndexing, ProofOfIndexingEvent, ProofOfIndexingFinisher,
-    ProofOfIndexingVersion, SharedProofOfIndexing,
+    PoICausalityRegion, PoiContribution, ProofOfIndexing, ProofOfIndexingEvent,
+    ProofOfIndexingFinisher, ProofOfIndexingVersion, SharedProofOfIndexing,
 };
 pub use self::registrar::{SubgraphRegistrar, SubgraphVersionSwitchingMode};
 pub use self::settings::{Setting, Settings};

@@ -60,7 +60,36 @@ pub fn logger_with_levels(show_debug: bool, levels: Option<&str>) -> Logger {
         .chan_size(20000)
         .build()
         .fuse();
+    // The async drain copies each record it is handed and filters on its own thread; drop the
+    // records no filter can let through before that, where they are logged.
+    let drain = LevelFilter::new(drain, most_verbose_level(show_debug, levels)).fuse();
     Logger::root(drain, o!())
+}
+
+/// The most verbose level `levels` (`env_logger` directives) or `show_debug` can enable.
+fn most_verbose_level(show_debug: bool, levels: Option<&str>) -> Level {
+    let mut most = if show_debug {
+        Level::Debug
+    } else {
+        Level::Info
+    };
+    let directives = levels.unwrap_or("").split('/').next().unwrap_or("");
+    for directive in directives.split(',').map(str::trim) {
+        if directive.is_empty() {
+            continue;
+        }
+        let level = directive.rsplit('=').next().unwrap_or("");
+        let level = match level.to_ascii_lowercase().as_str() {
+            "off" | "error" | "warn" | "info" => continue,
+            "debug" => Level::Debug,
+            // `trace`, or a bare module name, which enables every level for the module.
+            _ => Level::Trace,
+        };
+        if level.as_usize() > most.as_usize() {
+            most = level;
+        }
+    }
+    most
 }
 
 pub fn discard() -> Logger {

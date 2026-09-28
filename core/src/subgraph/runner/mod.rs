@@ -25,7 +25,10 @@ use graph::components::subgraph::InstanceDSTemplate;
 use graph::components::trigger_processor::RunnableTriggers;
 use graph::components::{
     store::ModificationsAndCache,
-    subgraph::{MappingError, PoICausalityRegion, ProofOfIndexing, SharedProofOfIndexing},
+    subgraph::{
+        MappingError, PoICausalityRegion, ProofOfIndexing, ProofOfIndexingVersion,
+        SharedProofOfIndexing,
+    },
 };
 use graph::data::store::scalar::Bytes;
 use graph::data::subgraph::schema::SubgraphError;
@@ -119,6 +122,7 @@ where
                 entity_lfu_cache: LfuCache::new(),
                 entity_cache_complete: false,
                 cached_head_ptr: None,
+                recent_head_ptr: None,
                 postponed_indexes_created: false,
             },
             logger,
@@ -601,7 +605,7 @@ where
         if block.trigger_count() == 0
             && self.state.skip_ptr_updates_timer.elapsed() <= SKIP_PTR_UPDATES_THRESHOLD
             && !self.inputs.store.is_deployment_synced()
-            && !close_to_chain_head(&block_ptr, &self.inputs.chain.chain_head_ptr().await?, 1000)
+            && !close_to_chain_head(&block_ptr, &self.recent_head_ptr().await?, 1000)
             && !max_end_block_reached
         {
             // Skip this block and continue with the same stream
@@ -751,7 +755,13 @@ where
         self.state.entity_cache_complete = complete;
 
         if !mods.is_empty() {
-            info!(&logger, "Applying {} entity operation(s)", mods.len());
+            // Per-block progress is logged at info once synced; while catching up, one line per
+            // block (hundreds of thousands) costs the runner more than it tells.
+            if self.inputs.store.is_deployment_synced() {
+                info!(&logger, "Applying {} entity operation(s)", mods.len());
+            } else {
+                debug!(&logger, "Applying {} entity operation(s)", mods.len());
+            }
         }
 
         let err_count = deterministic_errors.len();
@@ -1093,6 +1103,7 @@ where
         let worth_running: Arc<dyn Fn(String) -> bool + Send + Sync> =
             Arc::new(move |handler: String| stats.worth_running(&handler));
         let number = ptr.number;
+        let fast_poi = matches!(self.inputs.poi_version, ProofOfIndexingVersion::Fast);
         let run = async move {
             // The block's runs proceed together, so their host calls overlap.
             let runs = jobs.into_iter().map(|(key, host, trigger)| {
@@ -1108,7 +1119,11 @@ where
                 );
                 async move { (key, run.await) }
             });
-            let results = graph::futures03::future::join_all(runs).await;
+            let mut results = graph::futures03::future::join_all(runs).await;
+            if fast_poi {
+                // Hash here rather than on the runner's thread.
+                speculation::precompute_poi(number, &mut results);
+            }
             // The runner may have dropped the block's runs (a revert, say).
             let _ = sender.send(results);
         };
@@ -1383,8 +1398,11 @@ where
                 "block_hash" => format!("{}", block_ptr.hash)
         ));
 
-        info!(logger, "Start processing block";
-               "triggers" => triggers.len());
+        if self.inputs.store.is_deployment_synced() {
+            info!(logger, "Start processing block"; "triggers" => triggers.len());
+        } else {
+            debug!(logger, "Start processing block"; "triggers" => triggers.len());
+        }
 
         let proof_of_indexing =
             SharedProofOfIndexing::new(block_ptr.number, self.inputs.poi_version);
@@ -1794,6 +1812,20 @@ where
             );
             block_state.persist_data_source(data_source.as_stored_dynamic_data_source());
         }
+    }
+
+    /// The chain head, read at most a second ago. Deciding whether a block is within 1000 blocks
+    /// of the head does not need a fresher one, and reading it for every block adds up.
+    async fn recent_head_ptr(&mut self) -> Result<Option<BlockPtr>, Error> {
+        const MAX_AGE: Duration = Duration::from_secs(1);
+        if let Some((read, head)) = &self.state.recent_head_ptr
+            && read.elapsed() < MAX_AGE
+        {
+            return Ok(head.clone());
+        }
+        let head = self.inputs.chain.chain_head_ptr().await?;
+        self.state.recent_head_ptr = Some((Instant::now(), head.clone()));
+        Ok(head)
     }
 
     /// We consider a subgraph caught up when it's at most 10 blocks behind the chain head.

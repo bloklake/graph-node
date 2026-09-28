@@ -19,6 +19,9 @@ pub struct IndexingState {
     /// `EntityCache::mark_complete`).
     pub entity_cache_complete: bool,
     pub cached_head_ptr: Option<BlockPtr>,
+    /// The chain head as last read for deciding whether to skip a block without triggers, and
+    /// when it was read.
+    pub recent_head_ptr: Option<(Instant, Option<BlockPtr>)>,
     /// Set to `true` once postponed indexes have been created. This
     /// ensures we only trigger index creation once per subgraph run.
     pub postponed_indexes_created: bool,

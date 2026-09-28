@@ -114,16 +114,15 @@ fn asc_type_derive_struct(item_struct: ItemStruct) -> TokenStream {
                     if misalignment > 0 {
                         let padding_size = field_align - misalignment;
 
-                        bytes.extend_from_slice(&vec![0; padding_size]);
+                        bytes.resize(bytes.len() + padding_size, 0);
 
                         offset += padding_size;
                     }
 
-                    let field_bytes = self.#field_names.to_asc_bytes()?;
+                    let before = bytes.len();
+                    self.#field_names.append_asc_bytes(&mut bytes)?;
 
-                    bytes.extend_from_slice(&field_bytes);
-
-                    offset += field_bytes.len();
+                    offset += bytes.len() - before;
 
                     if max_align < field_align {
                         max_align = field_align;
@@ -136,7 +135,7 @@ fn asc_type_derive_struct(item_struct: ItemStruct) -> TokenStream {
                 if struct_misalignment > 0 {
                     let padding_size = max_align - struct_misalignment;
 
-                    bytes.extend_from_slice(&vec![0; padding_size]);
+                    bytes.resize(bytes.len() + padding_size, 0);
                 }
 
                 // **Important** AssemblyScript and `repr(C)` in Rust does not follow exactly

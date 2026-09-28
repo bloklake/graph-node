@@ -4,7 +4,7 @@ mod reference;
 
 pub use event::ProofOfIndexingEvent;
 use graph_derive::CheapClone;
-pub use online::{ProofOfIndexing, ProofOfIndexingFinisher};
+pub use online::{PoiContribution, ProofOfIndexing, ProofOfIndexingFinisher};
 pub use reference::PoICausalityRegion;
 
 use atomic_refcell::AtomicRefCell;
@@ -53,6 +53,24 @@ impl SharedProofOfIndexing {
         if let Some(poi) = &self.poi {
             let mut poi = poi.deref().borrow_mut();
             poi.write(logger, causality_region, poi_event);
+        }
+    }
+
+    /// Writes the event `contribution` was computed for if it belongs at `position`; see
+    /// `ProofOfIndexing::write_contribution`. Returns whether the event needs no other write.
+    pub fn write_contribution(
+        &self,
+        causality_region: &str,
+        position: u64,
+        contribution: &PoiContribution,
+    ) -> bool {
+        match &self.poi {
+            Some(poi) => poi.deref().borrow_mut().write_contribution(
+                causality_region,
+                position,
+                contribution,
+            ),
+            None => true,
         }
     }
 
