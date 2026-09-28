@@ -2133,6 +2133,7 @@ fn receipt_merge_test_event_handler(
     receipt: bool,
 ) -> crate::data_source::MappingEventHandler {
     crate::data_source::MappingEventHandler {
+        signature_hash: sig,
         event: "Event()".to_string(),
         topic0: Some(sig),
         topic1,

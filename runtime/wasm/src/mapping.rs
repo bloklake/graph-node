@@ -365,6 +365,11 @@ impl MappingContext {
 // See the start_index comment below for more information.
 const GN_START_FUNCTION_NAME: &str = "gn::start";
 
+/// Type id indexes below this are cached in a lock-free table.
+const ASC_TYPE_ID_SLOTS: usize = 8192;
+/// Marks a slot of that table whose type id is not known yet.
+const UNKNOWN_TYPE_ID: u32 = u32::MAX;
+
 /// The engine every module is compiled for. Sharing it lets all instances come from one
 /// pool (`GRAPH_WASM_INSTANCE_POOL`), so a trigger's instance reuses memory instead of mapping
 /// and unmapping a fresh reservation.
@@ -445,6 +450,9 @@ pub struct ValidModule {
     /// Cache for asc_type_id results. Maps IndexForAscTypeId to their WASM runtime
     /// type IDs. Populated lazily on first use; deterministic per compiled module.
     asc_type_id_cache: RwLock<HashMap<IndexForAscTypeId, u32>>,
+    /// Type ids for the (dense, small) indexes of real types, readable without a lock;
+    /// every speculation thread looks them up for every object it creates.
+    asc_type_ids: Box<[std::sync::atomic::AtomicU32]>,
 }
 
 impl ValidModule {
@@ -539,15 +547,27 @@ impl ValidModule {
             timeout,
             epoch_counter_abort_handle,
             asc_type_id_cache: RwLock::new(HashMap::new()),
+            asc_type_ids: (0..ASC_TYPE_ID_SLOTS)
+                .map(|_| std::sync::atomic::AtomicU32::new(UNKNOWN_TYPE_ID))
+                .collect(),
         })
     }
 
     pub fn get_cached_type_id(&self, idx: IndexForAscTypeId) -> Option<u32> {
+        if let Some(slot) = self.asc_type_ids.get(idx as usize) {
+            let id = slot.load(Ordering::Relaxed);
+            return (id != UNKNOWN_TYPE_ID).then_some(id);
+        }
         self.asc_type_id_cache.read().get(&idx).copied()
     }
 
     pub fn cache_type_id(&self, idx: IndexForAscTypeId, type_id: u32) {
-        self.asc_type_id_cache.write().insert(idx, type_id);
+        match self.asc_type_ids.get(idx as usize) {
+            Some(slot) if type_id != UNKNOWN_TYPE_ID => slot.store(type_id, Ordering::Relaxed),
+            _ => {
+                self.asc_type_id_cache.write().insert(idx, type_id);
+            }
+        }
     }
 }
 
