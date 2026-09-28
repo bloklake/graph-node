@@ -110,6 +110,8 @@ pub struct RuntimeHost<C: Blockchain> {
     mapping_request_sender: Sender<WasmRequest<C>>,
     host_exports: Arc<HostExports>,
     metrics: Arc<HostMetrics>,
+    /// The compiled module and metrics for speculative runs; `None` when speculation is off.
+    speculation: Option<(Arc<crate::mapping::ValidModule>, Arc<HostMetrics>)>,
 }
 
 impl<C> RuntimeHost<C>
@@ -144,12 +146,19 @@ where
 
         let host_fns = runtime_adapter.host_fns(&data_source).unwrap_or_default();
 
+        let speculation = match (ENV_VARS.mappings.speculation_threads, data_source.runtime()) {
+            (0, _) | (_, None) => None,
+            (_, Some(bytes)) => crate::mapping::registered_module(bytes.as_ref())
+                .map(|module| (module, Arc::new(metrics.speculative()))),
+        };
+
         Ok(RuntimeHost {
             host_fns: Arc::new(host_fns),
             data_source,
             mapping_request_sender,
             host_exports,
             metrics,
+            speculation,
         })
     }
 
@@ -224,7 +233,10 @@ where
 }
 
 #[async_trait]
-impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
+impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C>
+where
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
+{
     fn data_source(&self) -> &DataSource<C> {
         &self.data_source
     }
@@ -284,6 +296,43 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
 
     fn host_metrics(&self) -> Arc<HostMetrics> {
         self.metrics.cheap_clone()
+    }
+
+    fn speculate(
+        &self,
+        logger: &Logger,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
+        state: BlockState,
+    ) -> Option<graph::futures03::channel::oneshot::Receiver<Result<BlockState, MappingError>>>
+    {
+        let (module, metrics) = self.speculation.as_ref()?;
+        let ctx = MappingContext {
+            logger: logger.cheap_clone(),
+            host_exports: self.host_exports.cheap_clone(),
+            block_ptr: trigger.block_ptr(),
+            timestamp: trigger.timestamp(),
+            state,
+            // The runner writes the proof of indexing events when it replays the writes.
+            proof_of_indexing: SharedProofOfIndexing::ignored(),
+            host_fns: self.host_fns.cheap_clone(),
+            debug_fork: None,
+            mapping_logger: Logger::new(logger, o!("component" => "UserMapping")),
+            instrument: false,
+        };
+        let experimental_features = ExperimentalFeatures {
+            allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
+        };
+        crate::mapping::speculate(
+            module.cheap_clone(),
+            ctx,
+            trigger,
+            metrics.cheap_clone(),
+            experimental_features,
+        )
+    }
+
+    fn poi_causality_region(&self) -> Option<&str> {
+        Some(&self.host_exports.poi_causality_region)
     }
 }
 

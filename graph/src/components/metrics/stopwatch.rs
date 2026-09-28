@@ -92,6 +92,15 @@ impl StopwatchMetrics {
         }
     }
 
+    /// A stopwatch that records nothing, for work that runs concurrently with the sections this
+    /// one measures (sections must nest, so parallel work cannot share them).
+    pub fn disabled_copy(&self) -> Self {
+        StopwatchMetrics {
+            disabled: Arc::new(AtomicBool::new(true)),
+            inner: self.inner.clone(),
+        }
+    }
+
     /// Turns `start_section` and `end_section` into no-ops, no more metrics will be updated.
     pub fn disable(&self) {
         self.disabled.store(true, Ordering::SeqCst)

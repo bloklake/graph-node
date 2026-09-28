@@ -9,7 +9,8 @@ pub use crate::prelude::Entity;
 
 pub use self::host::{HostMetrics, MappingError, RuntimeHost, RuntimeHostBuilder};
 pub use self::instance::{
-    BlockState, BlockStateCheckpoint, InstanceDSTemplate, InstanceDSTemplateInfo,
+    BlockState, BlockStateCheckpoint, InstanceDSTemplate, InstanceDSTemplateInfo, SpeculationLog,
+    SpeculativeOp,
 };
 pub use self::instance_manager::SubgraphInstanceManager;
 pub use self::proof_of_indexing::{

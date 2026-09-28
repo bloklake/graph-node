@@ -32,6 +32,10 @@ pub struct EnvVarsMapping {
     /// 1024); instantiating from a pool avoids mapping fresh memory for every trigger. `0`
     /// allocates every instance on demand instead.
     pub wasm_instance_pool: u32,
+    /// Threads that run handlers ahead of the block being processed
+    /// (`GRAPH_SPECULATION_THREADS`, default 0 = off). A speculative run is kept only when
+    /// nothing it read changed before its turn; its writes are then replayed in order.
+    pub speculation_threads: usize,
 
     /// Set by the environment variable `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`
     /// (expressed in bytes). The default value is 1MiB.
@@ -155,6 +159,7 @@ impl TryFrom<InnerMappingHandlers> for EnvVarsMapping {
             timeout: x.mapping_handler_timeout_in_secs.map(Duration::from_secs),
             max_stack_size: x.runtime_max_stack_size.0.0,
             wasm_instance_pool: x.wasm_instance_pool,
+            speculation_threads: x.speculation_threads,
 
             max_ipfs_cache_file_size: x.max_ipfs_cache_file_size.0,
             max_ipfs_cache_size: x.max_ipfs_cache_size,
@@ -188,6 +193,8 @@ pub struct InnerMappingHandlers {
     runtime_max_stack_size: WithDefaultUsize<NoUnderscores<usize>, { 512 * 1024 }>,
     #[envconfig(from = "GRAPH_WASM_INSTANCE_POOL", default = "1024")]
     wasm_instance_pool: u32,
+    #[envconfig(from = "GRAPH_SPECULATION_THREADS", default = "0")]
+    speculation_threads: usize,
 
     // IPFS.
     #[envconfig(from = "GRAPH_MAX_IPFS_CACHE_FILE_SIZE", default = "")]

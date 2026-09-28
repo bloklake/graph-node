@@ -94,6 +94,23 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
 
     /// Return a metrics object for this host.
     fn host_metrics(&self) -> Arc<HostMetrics>;
+
+    /// Runs `trigger` ahead of time on a speculation thread against `state` (a fresh state
+    /// whose `speculation` log records what the handler reads and writes). `None` when this
+    /// host cannot speculate; the default.
+    fn speculate(
+        &self,
+        _logger: &Logger,
+        _trigger: TriggerWithHandler<MappingTrigger<C>>,
+        _state: BlockState,
+    ) -> Option<futures03::channel::oneshot::Receiver<Result<BlockState, MappingError>>> {
+        None
+    }
+
+    /// The causality region this host's handlers write proof of indexing events to.
+    fn poi_causality_region(&self) -> Option<&str> {
+        None
+    }
 }
 
 pub struct HostMetrics {
@@ -105,6 +122,17 @@ pub struct HostMetrics {
 }
 
 impl HostMetrics {
+    /// The same metrics without the stopwatch, for handlers run on speculation threads.
+    pub fn speculative(&self) -> Self {
+        HostMetrics {
+            handler_execution_time: self.handler_execution_time.clone(),
+            host_fn_execution_time: self.host_fn_execution_time.clone(),
+            eth_call_execution_time: self.eth_call_execution_time.clone(),
+            gas_metrics: self.gas_metrics.clone(),
+            stopwatch: self.stopwatch.disabled_copy(),
+        }
+    }
+
     pub fn new(
         registry: Arc<MetricsRegistry>,
         subgraph: &str,

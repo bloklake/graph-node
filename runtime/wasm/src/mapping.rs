@@ -34,6 +34,7 @@ where
     static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     let valid_module = Arc::new(ValidModule::new(&logger, raw_module, timeout)?);
+    register_module(raw_module, &valid_module);
 
     // Create channel for event handling requests
     let (mapping_request_sender, mapping_request_receiver) = mpsc::channel(100);
@@ -120,6 +121,142 @@ where
     .context("Spawning WASM runtime thread failed")?;
 
     Ok(mapping_request_sender)
+}
+
+/// Compiled modules by the keccak hash of their bytes, so every host running the same module
+/// finds it for speculative runs; `POINTERS` remembers which byte buffers hash to what.
+struct ModuleRegistry {
+    by_hash: HashMap<[u8; 32], std::sync::Weak<ValidModule>>,
+    pointers: HashMap<(usize, usize), [u8; 32]>,
+}
+
+static MODULES: std::sync::LazyLock<std::sync::Mutex<ModuleRegistry>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(ModuleRegistry {
+            by_hash: HashMap::new(),
+            pointers: HashMap::new(),
+        })
+    });
+
+fn module_hash(raw_module: &[u8]) -> [u8; 32] {
+    graph::prelude::alloy::primitives::keccak256(raw_module).0
+}
+
+fn register_module(raw_module: &[u8], module: &Arc<ValidModule>) {
+    let hash = module_hash(raw_module);
+    let mut modules = MODULES.lock().unwrap();
+    modules
+        .by_hash
+        .retain(|_, module| module.strong_count() > 0);
+    modules.by_hash.insert(hash, Arc::downgrade(module));
+    modules
+        .pointers
+        .insert((raw_module.as_ptr() as usize, raw_module.len()), hash);
+}
+
+/// The module compiled from these bytes, if it is still alive.
+pub(crate) fn registered_module(raw_module: &[u8]) -> Option<Arc<ValidModule>> {
+    let pointer = (raw_module.as_ptr() as usize, raw_module.len());
+    let known = MODULES.lock().unwrap().pointers.get(&pointer).copied();
+    let hash = match known {
+        Some(hash) => hash,
+        None => {
+            let hash = module_hash(raw_module);
+            let mut modules = MODULES.lock().unwrap();
+            // Keep the alias table from growing without bound as data sources come and go.
+            if modules.pointers.len() > 100_000 {
+                modules.pointers.clear();
+            }
+            modules.pointers.insert(pointer, hash);
+            hash
+        }
+    };
+    MODULES
+        .lock()
+        .unwrap()
+        .by_hash
+        .get(&hash)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+type SpeculationJob = Box<dyn FnOnce() + Send>;
+
+/// The threads that run speculative handler executions for all modules
+/// (`GRAPH_SPECULATION_THREADS`); `None` when speculation is off.
+fn speculation_pool() -> Option<&'static std::sync::mpsc::Sender<SpeculationJob>> {
+    static POOL: std::sync::OnceLock<Option<std::sync::mpsc::Sender<SpeculationJob>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = ENV_VARS.mappings.speculation_threads;
+        if threads == 0 {
+            return None;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel::<SpeculationJob>();
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        for i in 0..threads {
+            let receiver = receiver.clone();
+            thread::Builder::new()
+                .name(format!("speculation-{i:0>3}"))
+                .spawn(move || {
+                    loop {
+                        let job = receiver.lock().unwrap().recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("spawning a speculation thread");
+        }
+        Some(sender)
+    })
+    .as_ref()
+}
+
+/// Runs `trigger` against `ctx` on a speculation thread and delivers the resulting block state.
+/// `None` when speculation is off.
+pub(crate) fn speculate<C: Blockchain>(
+    valid_module: Arc<ValidModule>,
+    ctx: MappingContext,
+    trigger: TriggerWithHandler<MappingTrigger<C>>,
+    host_metrics: Arc<HostMetrics>,
+    experimental_features: ExperimentalFeatures,
+) -> Option<graph::futures03::channel::oneshot::Receiver<Result<BlockState, MappingError>>>
+where
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
+{
+    let pool = speculation_pool()?;
+    let runtime = tokio::runtime::Handle::current();
+    let (sender, receiver) = graph::futures03::channel::oneshot::channel();
+    let job: SpeculationJob = Box::new(move || {
+        let _runtime_guard = runtime.enter();
+        let logger = ctx.logger.cheap_clone();
+        let run = async move {
+            let module = WasmInstance::from_valid_module_with_ctx(
+                valid_module,
+                ctx,
+                host_metrics,
+                experimental_features,
+            )
+            .await
+            .map_err(MappingError::Unknown)?;
+            module
+                .handle_trigger(trigger)
+                .await
+                .map(|(state, _gas)| state)
+        };
+        let result =
+            panic::catch_unwind(AssertUnwindSafe(|| graph::block_on(run))).unwrap_or_else(|_| {
+                Err(MappingError::Unknown(anyhow!(
+                    "speculative handler run panicked"
+                )))
+            });
+        if sender.send(result).is_err() {
+            trace!(logger, "Speculative result no longer wanted");
+        }
+    });
+    pool.send(job).ok()?;
+    Some(receiver)
 }
 
 async fn instantiate_module<C: Blockchain>(

@@ -1,3 +1,4 @@
+mod speculation;
 mod state;
 mod trigger_runner;
 
@@ -34,6 +35,7 @@ use graph::data_source::{
 use graph::env::EnvVars;
 use graph::ext::futures::Cancelable;
 use graph::futures03::stream::StreamExt;
+use graph::prelude::RuntimeHost as _;
 use graph::prelude::{
     BlockNumber, BlockPtr, BlockState, CancelGuard, CancelHandle, CancelToken as _,
     CheapClone as _, ENV_VARS, EntityCache, EntityModification, Error, InstanceDSTemplateInfo,
@@ -73,7 +75,14 @@ where
     /// The current state in the runner's state machine.
     /// This field drives the main loop of the runner.
     runner_state: RunnerState<C>,
+    /// Block stream events read ahead of the block being processed.
+    /// (`None` is the end of the stream.)
+    lookahead: std::collections::VecDeque<Option<StreamItem<C>>>,
+    /// Speculative runs of the read-ahead blocks' triggers; `None` when speculation is off.
+    speculations: Option<speculation::Speculations>,
 }
+
+type StreamItem<C> = <Cancelable<Box<dyn BlockStream<C>>> as graph::futures03::Stream>::Item;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubgraphRunnerError {
@@ -116,6 +125,9 @@ where
             metrics,
             cancel_handle: None,
             runner_state: RunnerState::Initializing,
+            lookahead: std::collections::VecDeque::new(),
+            speculations: (ENV_VARS.mappings.speculation_threads > 0)
+                .then(speculation::Speculations::default),
         }
     }
 
@@ -324,10 +336,14 @@ where
         &mut self,
         mut block_stream: Cancelable<Box<dyn BlockStream<C>>>,
     ) -> Result<RunnerState<C>, SubgraphRunnerError> {
-        let event = {
-            let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
-            block_stream.next().await
+        let event = match self.lookahead.pop_front() {
+            Some(event) => event,
+            None => {
+                let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
+                block_stream.next().await
+            }
         };
+        self.read_ahead(&mut block_stream);
 
         if self.is_canceled() {
             return self.cancel();
@@ -418,6 +434,12 @@ where
         reason: RestartReason,
     ) -> Result<RunnerState<C>, SubgraphRunnerError> {
         debug!(self.logger, "Starting or restarting subgraph"; "reason" => ?reason);
+
+        // Read-ahead events belong to the block stream being replaced.
+        self.lookahead.clear();
+        if let Some(speculations) = &self.speculations {
+            speculations.clear();
+        }
 
         // If restarting due to store error, try to restart the store
         if matches!(reason, RestartReason::StoreError) {
@@ -630,6 +652,10 @@ where
         revert_to_ptr: BlockPtr,
         cursor: FirehoseCursor,
     ) -> RunnerState<C> {
+        // Speculative runs read state the revert removes.
+        if let Some(speculations) = &self.speculations {
+            speculations.clear();
+        }
         let stopwatch = &self.metrics.stream.stopwatch;
         let _section = stopwatch.start_section(HANDLE_REVERT_SECTION_NAME);
 
@@ -714,6 +740,10 @@ where
         log_evict_stats(&self.logger, &evict_stats);
 
         mods.extend(offchain_mods);
+
+        if let Some(speculations) = &self.speculations {
+            speculations.record_writes(block_ptr.number, &mods);
+        }
 
         // Put the cache back in the state, asserting that the placeholder cache was not used.
         assert!(self.state.entity_lfu_cache.is_empty());
@@ -908,22 +938,147 @@ where
         proof_of_indexing: &SharedProofOfIndexing,
         causality_region: &str,
     ) -> Result<BlockState, MappingError> {
-        let trigger_runner = TriggerRunner::new(
-            self.ctx.trigger_processor.as_ref(),
-            &self.logger,
-            &self.metrics.subgraph,
-            &self.inputs.debug_fork,
-            self.inputs.instrument,
-        );
-        trigger_runner
-            .execute(
-                block,
-                runnables,
-                block_state,
-                proof_of_indexing,
-                causality_region,
-            )
-            .await
+        let Some(speculations) = &self.speculations else {
+            let trigger_runner = TriggerRunner::new(
+                self.ctx.trigger_processor.as_ref(),
+                &self.logger,
+                &self.metrics.subgraph,
+                &self.inputs.debug_fork,
+                self.inputs.instrument,
+            );
+            return trigger_runner
+                .execute(
+                    block,
+                    runnables,
+                    block_state,
+                    proof_of_indexing,
+                    causality_region,
+                )
+                .await;
+        };
+
+        let hash = block.ptr().hash;
+        let mut state = block_state;
+        for (i, runnable) in runnables.into_iter().enumerate() {
+            let RunnableTriggers {
+                trigger,
+                hosted_triggers,
+            } = runnable;
+            if hosted_triggers.is_empty() {
+                continue;
+            }
+
+            // Use the speculative runs if every host of the trigger has a usable one.
+            let keys = hosted_triggers
+                .iter()
+                .map(|ht| (hash.clone(), i, speculation::host_id(ht.host)));
+            let specs = match speculations.take_all(keys) {
+                Some(pending) => speculations.resolve(pending, &state).await,
+                None => None,
+            };
+            if let Some(specs) = specs {
+                proof_of_indexing.start_handler(causality_region);
+                for (hosted, spec) in hosted_triggers.iter().zip(specs) {
+                    speculation::replay::<C, _>(
+                        &self.logger,
+                        hosted.host,
+                        spec,
+                        &mut state,
+                        proof_of_indexing,
+                    )
+                    .await
+                    .map_err(|e| e.add_trigger_context(&trigger))?;
+                }
+                continue;
+            }
+
+            state = self
+                .ctx
+                .trigger_processor
+                .process_trigger(
+                    &self.logger,
+                    hosted_triggers,
+                    block,
+                    state,
+                    proof_of_indexing,
+                    causality_region,
+                    &self.inputs.debug_fork,
+                    &self.metrics.subgraph,
+                    self.inputs.instrument,
+                )
+                .await
+                .map_err(|e| e.add_trigger_context(&trigger))?;
+        }
+        Ok(state)
+    }
+
+    /// Reads events the block stream has ready (without waiting) into `lookahead` and starts
+    /// speculative runs for their triggers.
+    fn read_ahead(&mut self, block_stream: &mut Cancelable<Box<dyn BlockStream<C>>>) {
+        use graph::futures03::FutureExt as _;
+
+        let Some(speculations) = &self.speculations else {
+            return;
+        };
+        while self.lookahead.len() < speculation::LOOKAHEAD_BLOCKS
+            && speculations.pending_len() < speculation::MAX_PENDING
+        {
+            let Some(mut event) = block_stream.next().now_or_never() else {
+                break;
+            };
+            let is_block = matches!(event, Some(Ok(BlockStreamEvent::ProcessBlock(..))));
+            if let Some(Ok(BlockStreamEvent::ProcessBlock(block, _))) = &mut event {
+                self.speculate_block(block);
+            }
+            self.lookahead.push_back(event);
+            if !is_block {
+                break;
+            }
+        }
+    }
+
+    /// Starts a speculative run for every (trigger, host) pair of `block`.
+    fn speculate_block(&self, block: &mut BlockWithTriggers<C>) {
+        let Some(speculations) = &self.speculations else {
+            return;
+        };
+        let snapshot = self.inputs.store.block_ptr().map_or(-1, |ptr| ptr.number);
+        let ptr = block.ptr();
+        let chain_block = Arc::new(block.block.clone());
+        let triggers = std::mem::take(&mut block.trigger_data);
+        for (i, trigger) in triggers.into_iter().enumerate() {
+            let data = match trigger {
+                Trigger::Chain(t) => TriggerData::Onchain(t),
+                Trigger::Subgraph(t) => TriggerData::Subgraph(t),
+            };
+            if matches!(data, TriggerData::Onchain(_)) {
+                for host in self.ctx.instance.hosts_for_trigger(&data) {
+                    let Ok(Some(mapping_trigger)) =
+                        host.match_and_decode(&data, &chain_block, &self.logger)
+                    else {
+                        continue;
+                    };
+                    let mut state = BlockState::new(
+                        self.inputs.store.clone(),
+                        LfuCache::new(),
+                        SeqGenerator::new(ptr.number),
+                    );
+                    state.speculation = Some(Default::default());
+                    if let Some(result) = host.speculate(&self.logger, mapping_trigger, state) {
+                        speculations.insert(
+                            (ptr.hash.clone(), i, speculation::host_id(host)),
+                            snapshot,
+                            result,
+                        );
+                    }
+                }
+            }
+            block.trigger_data.push(match data {
+                TriggerData::Onchain(t) => Trigger::Chain(t),
+                TriggerData::Subgraph(t) => Trigger::Subgraph(t),
+                TriggerData::Offchain(_) => unreachable!("block triggers are never offchain"),
+            });
+        }
     }
 
     /// Pipeline Stage 3: Process dynamically created data sources.

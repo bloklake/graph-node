@@ -51,7 +51,7 @@ pub struct HostExports {
     /// need to be each be stored separately to separate causality between them,
     /// and merge the results later. Right now, this is just the ethereum
     /// networks but will be expanded for ipfs and the availability chain.
-    poi_causality_region: String,
+    pub(crate) poi_causality_region: String,
     pub(crate) link_resolver: Arc<dyn LinkResolver>,
     ens_lookup: Arc<dyn EnsLookup>,
 }
@@ -250,6 +250,10 @@ impl HostExports {
                 .into());
             }
             let id_type = entity_type.id_type()?;
+            if let Some(log) = state.speculation.as_mut() {
+                // Generated ids depend on how many were generated before in the block.
+                log.unsupported = true;
+            }
             let id = state.entity_cache.seq_gen.id(id_type)?;
             data.insert(store::ID.clone(), id.clone().into());
             id.to_string()
@@ -335,6 +339,18 @@ impl HostExports {
 
         state.metrics.track_entity_write(&entity_type, &entity);
 
+        if let Some(log) = state.speculation.as_mut() {
+            // An entity that is not valid on its own is validated merged with the stored one.
+            if entity.validate(&key).is_err() {
+                log.reads.push(key.clone());
+            }
+            log.ops
+                .push(graph::components::subgraph::SpeculativeOp::Set {
+                    key: key.clone(),
+                    entity: entity.clone(),
+                });
+        }
+
         state
             .entity_cache
             .set(key, entity, Some(&mut state.write_capacity_remaining))
@@ -360,6 +376,10 @@ impl HostExports {
             &self.poi_causality_region,
             logger,
         );
+        let poi_strings = state
+            .speculation
+            .is_some()
+            .then(|| (entity_type.clone(), entity_id.clone()));
         let entity_type = state.entity_cache.schema.entity_type(&entity_type)?;
         Self::expect_object_type(&entity_type, "remove")?;
 
@@ -373,6 +393,14 @@ impl HostExports {
             "store_remove",
         )?;
 
+        if let (Some(log), Some((poi_type, poi_id))) = (state.speculation.as_mut(), poi_strings) {
+            log.ops
+                .push(graph::components::subgraph::SpeculativeOp::Remove {
+                    key: key.clone(),
+                    poi_type,
+                    poi_id,
+                });
+        }
         state.entity_cache.remove(key);
 
         Ok(())
@@ -392,6 +420,9 @@ impl HostExports {
         let store_key = entity_type.parse_key_in(entity_id, self.data_source.causality_region)?;
         self.check_entity_type_access(&store_key.entity_type)?;
 
+        if let Some(log) = state.speculation.as_mut() {
+            log.reads.push(store_key.clone());
+        }
         let result = state.entity_cache.get(&store_key, scope).await?;
 
         Self::track_gas_and_ops(
@@ -429,6 +460,12 @@ impl HostExports {
         };
         self.check_entity_type_access(&store_key.entity_type)?;
 
+        if let Some(log) = state.speculation.as_mut() {
+            match state.entity_cache.schema.get_field_related(&store_key) {
+                Ok((related, _)) => log.related_types.push(related),
+                Err(_) => log.unsupported = true,
+            }
+        }
         let result = state.entity_cache.load_related(&store_key).await?;
 
         Self::track_gas_and_ops(

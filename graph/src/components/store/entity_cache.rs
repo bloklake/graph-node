@@ -10,7 +10,7 @@ use crate::components::store::write::EntityModification;
 use crate::components::store::{self as s, Entity, EntityOperation};
 use crate::data::store::{EntityValidationError, Id, IdType, IntoEntityIterator};
 use crate::prelude::{CacheWeight, ENV_VARS, StopwatchMetrics};
-use crate::schema::{EntityKey, InputSchema};
+use crate::schema::{EntityKey, EntityType, InputSchema};
 use crate::util::intern::Error as InternError;
 use crate::util::lfu_cache::{EvictStats, LfuCache};
 
@@ -214,6 +214,19 @@ impl EntityCache {
             seq_gen,
             complete: false,
         }
+    }
+
+    /// Whether this block's handlers (including the running one) wrote `key`.
+    pub fn touched(&self, key: &EntityKey) -> bool {
+        self.updates.contains_key(key) || self.handler_updates.contains_key(key)
+    }
+
+    /// Whether this block's handlers wrote any entity of `entity_type`.
+    pub fn touched_type(&self, entity_type: &EntityType) -> bool {
+        self.updates
+            .keys()
+            .chain(self.handler_updates.keys())
+            .any(|key| &key.entity_type == entity_type)
     }
 
     /// Declares that the cache holds every entity the store has for this deployment (the
