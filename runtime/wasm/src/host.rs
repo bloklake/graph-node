@@ -7,7 +7,9 @@ use graph::futures03::channel::oneshot::channel;
 
 use graph::blockchain::{Blockchain, HostFn, RuntimeAdapter};
 use graph::components::store::{EnsLookup, SubgraphFork};
-use graph::components::subgraph::{MappingError, SharedProofOfIndexing, SpeculativeRun};
+use graph::components::subgraph::{
+    MappingError, SharedProofOfIndexing, SpeculativeResult, SpeculativeRun,
+};
 use graph::data_source::{
     DataSource, DataSourceTemplate, MappingTrigger, TriggerData, TriggerWithHandler,
 };
@@ -341,15 +343,19 @@ where
         let experimental_features = ExperimentalFeatures {
             allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
         };
-        crate::mapping::run_speculative(
+        let state = crate::mapping::run_speculative(
             module,
             ctx,
             mapping_trigger,
             metrics,
             experimental_features,
         )
-        .await
-        .map(|state| SpeculativeRun::Ran { state, handler })
+        .await?;
+        // Drop the rest of the run's block state here, not on the runner's thread.
+        let result = SpeculativeResult::from_state(state).ok_or_else(|| {
+            MappingError::Unknown(anyhow!("speculative run lost its speculation log"))
+        })?;
+        Ok(SpeculativeRun::Ran { result, handler })
     }
 
     fn poi_causality_region(&self) -> Option<&str> {

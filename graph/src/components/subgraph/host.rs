@@ -123,10 +123,35 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     }
 }
 
-/// The outcome of `RuntimeHost::speculate_trigger`.
+/// What a speculative run left behind (the rest of its block state is dropped where it ran).
+pub struct SpeculativeResult {
+    pub log: crate::components::subgraph::SpeculationLog,
+    pub created_data_sources: Vec<crate::components::subgraph::InstanceDSTemplateInfo>,
+    pub metrics: crate::components::metrics::block_state::BlockStateMetrics,
+    /// Whether the handler failed with a deterministic error.
+    pub failed: bool,
+}
+
+impl SpeculativeResult {
+    /// Takes the parts of a speculative run's `state` the runner needs.
+    pub fn from_state(mut state: BlockState) -> Option<Self> {
+        let log = state.speculation.take()?;
+        Some(SpeculativeResult {
+            log,
+            created_data_sources: state.drain_created_data_sources(),
+            metrics: std::mem::take(&mut state.metrics),
+            failed: !state.deterministic_errors.is_empty(),
+        })
+    }
+}
+
+/// The outcome of `RuntimeHost::run_speculative`.
 pub enum SpeculativeRun {
-    /// The handler ran; its block state records what it read and wrote.
-    Ran { state: BlockState, handler: String },
+    /// The handler ran; `result` is what the runner needs to judge and replay the run.
+    Ran {
+        result: SpeculativeResult,
+        handler: String,
+    },
     /// The trigger does not match the host.
     NotMatched,
     /// The host matched but its handler was not run (not worth it).

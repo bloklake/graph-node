@@ -18,7 +18,8 @@ use std::sync::Mutex;
 
 use graph::blockchain::BlockHash;
 use graph::components::subgraph::{
-    MappingError, ProofOfIndexingEvent, SharedProofOfIndexing, SpeculativeOp, SpeculativeRun,
+    MappingError, ProofOfIndexingEvent, SharedProofOfIndexing, SpeculativeOp, SpeculativeResult,
+    SpeculativeRun,
 };
 use graph::futures03::channel::oneshot;
 use graph::prelude::{BlockNumber, BlockState, EntityModification};
@@ -123,7 +124,12 @@ impl Stats {
 
     fn judged(&self, handler: &str, used: bool) {
         let mut inner = self.inner.lock().unwrap();
-        let stats = inner.handlers.entry(handler.to_string()).or_default();
+        if !inner.handlers.contains_key(handler) {
+            inner
+                .handlers
+                .insert(handler.to_string(), HandlerStats::default());
+        }
+        let stats = inner.handlers.get_mut(handler).expect("inserted above");
         stats.tried = stats.tried.saturating_add(1);
         stats.used = stats.used.saturating_add(u32::from(used));
     }
@@ -249,17 +255,13 @@ impl Speculations {
         &self,
         block: BlockNumber,
         snapshot: BlockNumber,
-        spec: &BlockState,
+        spec: &SpeculativeResult,
         state: &BlockState,
     ) -> bool {
-        if !spec.deterministic_errors.is_empty()
-            || state.write_capacity_remaining < MIN_WRITE_CAPACITY
-        {
+        if spec.failed || state.write_capacity_remaining < MIN_WRITE_CAPACITY {
             return false;
         }
-        let Some(log) = &spec.speculation else {
-            return false;
-        };
+        let log = &spec.log;
         if log.unsupported {
             return false;
         }
@@ -303,12 +305,12 @@ impl Speculations {
         trigger: usize,
         hosts: impl Iterator<Item = usize>,
         state: &BlockState,
-    ) -> Option<Vec<Option<BlockState>>> {
+    ) -> Option<Vec<Option<SpeculativeResult>>> {
         let mut out = Vec::new();
         for host in hosts {
             match ready.runs.remove(&(trigger, host))? {
                 Ok(SpeculativeRun::Ran {
-                    state: spec,
+                    result: spec,
                     handler,
                 }) => {
                     let valid = self.valid(block, ready.snapshot, &spec, state);
@@ -330,15 +332,17 @@ impl Speculations {
 /// `region` is the proof of indexing causality region the handler's host writes to.
 pub(super) async fn replay(
     logger: &Logger,
-    mut spec: BlockState,
+    spec: SpeculativeResult,
     state: &mut BlockState,
     proof_of_indexing: &SharedProofOfIndexing,
     region: &str,
 ) -> Result<(), MappingError> {
-    let log = spec
-        .speculation
-        .take()
-        .expect("speculative runs carry a speculation log");
+    let SpeculativeResult {
+        log,
+        created_data_sources,
+        metrics,
+        failed: _,
+    } = spec;
 
     state.enter_handler();
     for op in log.ops {
@@ -391,10 +395,10 @@ pub(super) async fn replay(
             }
         }
     }
-    for ds in spec.drain_created_data_sources() {
+    for ds in created_data_sources {
         state.push_created_data_source(ds);
     }
-    state.metrics.extend(spec.metrics);
+    state.metrics.extend(metrics);
     state.exit_handler();
     Ok(())
 }

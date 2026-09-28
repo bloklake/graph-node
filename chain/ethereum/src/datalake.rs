@@ -110,6 +110,9 @@ struct RecentScan {
     logs: HashMap<u64, Vec<Arc<Log>>>,
 }
 
+/// Ranges fetched ahead of the stream.
+const PREFETCH_DEPTH: BlockNumber = 3;
+
 /// Scans remembered for `recent_logs`.
 const RECENT_SCANS: usize = 8;
 
@@ -849,7 +852,15 @@ impl DatalakeClient {
         };
         let scanned = match scanned {
             Some(scanned) if scanned.to <= to => scanned,
-            Some(scanned) => self.trim(logger, scanned, to).await?,
+            Some(scanned) => {
+                // Keep the part beyond `to` as the next range's answer.
+                let (head, rest) = self.split(logger, scanned, to).await?;
+                if let Some(rest) = rest {
+                    let handle = tokio::spawn(async move { Ok(rest) });
+                    self.prefetched.lock().await.insert((key, to + 1), handle);
+                }
+                head
+            }
             None => self.fetch(logger, from, to, &filters).await?,
         };
 
@@ -869,18 +880,28 @@ impl DatalakeClient {
                 .saturating_mul(10)
                 .min(self.settings.max_block_range)
                 .min(by_density);
-            let client = self.clone();
-            let logger = logger.clone();
-            let handle = tokio::spawn(async move {
-                client
-                    .fetch(&logger, next, (next + size - 1).min(height), &filters)
-                    .await
-            });
             let mut prefetched = self.prefetched.lock().await;
             // A filter change or restarted stream leaves stale entries behind; they are few
             // and dropped here.
-            prefetched.retain(|(k, _), _| *k == key);
-            prefetched.insert((key, next), handle);
+            prefetched.retain(|(k, start), _| *k == key && *start >= next);
+            // Keep several ranges in flight: fetching and decoding a dense range can take as
+            // long as indexing one.
+            for depth in 0..PREFETCH_DEPTH {
+                let start = next + depth * size;
+                if start > height {
+                    break;
+                }
+                if prefetched.contains_key(&(key, start)) {
+                    continue;
+                }
+                let client = self.clone();
+                let logger = logger.clone();
+                let filters = filters.clone();
+                let end = (start + size - 1).min(height);
+                let handle =
+                    tokio::spawn(async move { client.fetch(&logger, start, end, &filters).await });
+                prefetched.insert((key, start), handle);
+            }
         }
         self.remember(from, &scanned, filter);
         Ok(Some(scanned))
@@ -934,17 +955,23 @@ impl DatalakeClient {
         )
     }
 
-    /// Cuts a prefetched scan back to end at `to`, which must then be in it.
-    async fn trim(
+    /// Splits a prefetched scan at `to`: the part up to `to` (which must then end with block
+    /// `to`) and the rest, if any.
+    async fn split(
         &self,
         logger: &Logger,
         mut scanned: Scanned,
         to: BlockNumber,
-    ) -> anyhow::Result<Scanned> {
+    ) -> anyhow::Result<(Scanned, Option<Scanned>)> {
         let last = u64::try_from(to).expect("block numbers are positive");
-        scanned
+        let at = scanned
             .blocks
-            .retain(|(block, _)| block.number_u64() <= last);
+            .partition_point(|(block, _)| block.number_u64() <= last);
+        let rest_blocks = scanned.blocks.split_off(at);
+        let rest = (!rest_blocks.is_empty()).then(|| Scanned {
+            blocks: rest_blocks,
+            to: scanned.to,
+        });
         if scanned.blocks.last().map(|(b, _)| b.number_u64()) != Some(last) {
             let mut headers = self.header(logger, to).await?;
             let (header, uncles) = headers
@@ -955,7 +982,7 @@ impl DatalakeClient {
                 .push((Arc::new(block(header, uncles, vec![])), vec![]));
         }
         scanned.to = to;
-        Ok(scanned)
+        Ok((scanned, rest))
     }
 
     async fn header(

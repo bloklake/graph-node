@@ -265,9 +265,10 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
             subgraph_current_block,
         );
         let stream = match &chain.settings.datalake {
-            // First range: a tenth of the largest.
+            // First range: a fiftieth of the largest (the first answer arrives quickly; ranges
+            // grow tenfold per step).
             Some(datalake) => {
-                stream.with_large_ranges(datalake.settings().max_block_range / 10, 2_000)
+                stream.with_large_ranges(datalake.settings().max_block_range / 50, 2_000)
             }
             None => stream,
         };
