@@ -40,8 +40,26 @@ pub(super) type Key = (BlockHash, usize, usize);
 pub(super) struct Pending {
     /// Last block the store had when the run was launched.
     snapshot: BlockNumber,
+    /// The handler, for `HandlerStats`.
+    handler: String,
     result: oneshot::Receiver<Result<BlockState, MappingError>>,
 }
+
+/// How often a handler's speculative runs could be used. Handlers whose runs mostly read
+/// state an earlier trigger changed (balances of busy accounts, say) are not worth running
+/// twice; they are speculated again now and then in case that changes.
+#[derive(Default, Clone, Copy)]
+struct HandlerStats {
+    tried: u32,
+    used: u32,
+}
+
+/// Runs judged before a handler's success rate decides anything.
+const STATS_MIN_TRIED: u32 = 64;
+/// Handlers whose runs are usable less often than this are not speculated...
+const STATS_MIN_USED_RATIO: f64 = 0.5;
+/// ...except every this many triggers, to notice when that changes.
+const STATS_PROBE_EVERY: u32 = 256;
 
 /// Which hosts each trigger of a read-ahead block was matched to when its runs were launched.
 pub(super) struct LaunchedBlock {
@@ -55,6 +73,9 @@ pub(super) struct LaunchedBlock {
 #[derive(Default)]
 struct Inner {
     pending: HashMap<Key, Pending>,
+    handlers: HashMap<String, HandlerStats>,
+    /// Triggers skipped since the last probe, per handler.
+    skipped: HashMap<String, u32>,
     blocks: HashMap<BlockHash, LaunchedBlock>,
     /// The last block in which each entity (type) was written, for blocks the runner processed
     /// while speculative runs may have been reading older state.
@@ -77,17 +98,54 @@ impl Speculations {
         self.inner.lock().unwrap().pending.len()
     }
 
+    /// Whether a trigger for `handler` should get a speculative run.
+    pub(super) fn worth_running(&self, handler: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let stats = inner.handlers.get(handler).copied().unwrap_or_default();
+        if stats.tried < STATS_MIN_TRIED
+            || f64::from(stats.used) >= STATS_MIN_USED_RATIO * f64::from(stats.tried)
+        {
+            return true;
+        }
+        let skipped = inner.skipped.entry(handler.to_string()).or_default();
+        *skipped += 1;
+        if *skipped >= STATS_PROBE_EVERY {
+            *skipped = 0;
+            // Judge the handler afresh from the probes.
+            inner.handlers.insert(
+                handler.to_string(),
+                HandlerStats {
+                    tried: STATS_MIN_TRIED / 2,
+                    used: STATS_MIN_TRIED / 2,
+                },
+            );
+            return true;
+        }
+        false
+    }
+
     pub(super) fn insert(
         &self,
         key: Key,
         snapshot: BlockNumber,
+        handler: String,
         result: oneshot::Receiver<Result<BlockState, MappingError>>,
     ) {
-        self.inner
-            .lock()
-            .unwrap()
-            .pending
-            .insert(key, Pending { snapshot, result });
+        self.inner.lock().unwrap().pending.insert(
+            key,
+            Pending {
+                snapshot,
+                handler,
+                result,
+            },
+        );
+    }
+
+    fn judged(&self, handler: &str, used: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        let stats = inner.handlers.entry(handler.to_string()).or_default();
+        stats.tried = stats.tried.saturating_add(1);
+        stats.used = stats.used.saturating_add(u32::from(used));
     }
 
     pub(super) fn launched(&self, hash: BlockHash, block: LaunchedBlock) {
@@ -173,12 +231,22 @@ impl Speculations {
         state: &BlockState,
     ) -> Option<Vec<BlockState>> {
         let mut out = Vec::with_capacity(pending.len());
-        for Pending { snapshot, result } in pending {
+        for Pending {
+            snapshot,
+            handler,
+            result,
+        } in pending
+        {
             let spec = match result.await {
                 Ok(Ok(spec)) => spec,
-                _ => return None,
+                _ => {
+                    self.judged(&handler, false);
+                    return None;
+                }
             };
-            if !self.valid(snapshot, &spec, state) {
+            let valid = self.valid(snapshot, &spec, state);
+            self.judged(&handler, valid);
+            if !valid {
                 return None;
             }
             out.push(spec);

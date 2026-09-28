@@ -1071,6 +1071,11 @@ where
                         complete = false;
                         continue;
                     }
+                    let handler = mapping_trigger.handler_name().to_string();
+                    if !speculations.worth_running(&handler) {
+                        complete = false;
+                        continue;
+                    }
                     let mut state = BlockState::new(
                         self.inputs.store.clone(),
                         LfuCache::new(),
@@ -1080,7 +1085,12 @@ where
                     match host.speculate(&self.logger, mapping_trigger, state) {
                         Some(result) => {
                             let id = speculation::host_id(host);
-                            speculations.insert((ptr.hash.clone(), i, id), snapshot, result);
+                            speculations.insert(
+                                (ptr.hash.clone(), i, id),
+                                snapshot,
+                                handler,
+                                result,
+                            );
                             hosts.push(id);
                         }
                         None => complete = false,

@@ -558,6 +558,16 @@ impl<C: Blockchain> TriggersAdapterWrapper<C> {
         self.adapter.parent_ptr(block).await
     }
 
+    /// See [`TriggersAdapter::final_block_number`]; subgraphs that read other subgraphs rely on
+    /// the reorg threshold alone.
+    pub async fn final_block_number(&self) -> Result<Option<BlockNumber>, Error> {
+        if self.source_subgraph_stores.is_empty() {
+            self.adapter.final_block_number().await
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
         if self.source_subgraph_stores.is_empty() {
             return self.adapter.chain_head_ptr().await;
@@ -619,6 +629,13 @@ pub trait TriggersAdapter<C: Blockchain>: Send + Sync {
 
     /// Get pointer to parent of `block`. This is called when reverting `block`.
     async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+
+    /// The highest block a trusted source says is final (can no longer be reorged). Blocks up
+    /// to it are scanned like blocks beyond the reorg threshold, even when they are closer to
+    /// the head than that. `None` (the default) leaves only the reorg threshold.
+    async fn final_block_number(&self) -> Result<Option<BlockNumber>, Error> {
+        Ok(None)
+    }
 
     async fn load_block_ptrs_by_numbers(
         &self,

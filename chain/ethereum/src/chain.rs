@@ -1070,6 +1070,13 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         Ok(None)
     }
 
+    async fn final_block_number(&self) -> Result<Option<BlockNumber>, Error> {
+        match &self.datalake {
+            Some(datalake) => Ok(datalake.finalized_height().await.unwrap_or(None)),
+            None => Ok(None),
+        }
+    }
+
     async fn triggers_in_block(
         &self,
         logger: &Logger,

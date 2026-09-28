@@ -61,6 +61,14 @@ pub struct DatalakeSettings {
     /// Per-request timeout, in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Treat blocks the datalake reports as finalized (`finalized_block`) as final, so they
+    /// are indexed from the datalake even within the reorg threshold of the chain head.
+    #[serde(default = "default_true")]
+    pub trust_finalized: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_block_range() -> BlockNumber {
@@ -87,7 +95,7 @@ const ATTEMPTS: u32 = 4;
 pub struct DatalakeClient {
     settings: DatalakeSettings,
     http: reqwest::Client,
-    height: Mutex<Option<(Instant, Option<BlockNumber>)>>,
+    height: Mutex<Option<(Instant, Heights)>>,
     /// Scans started ahead of time, by filter fingerprint and first block.
     prefetched: Mutex<HashMap<(u64, BlockNumber), JoinHandle<anyhow::Result<Scanned>>>>,
     /// The last scans' logs, to answer re-scans of single blocks (for data sources created in
@@ -116,6 +124,13 @@ impl std::fmt::Debug for DatalakeClient {
 #[derive(Deserialize)]
 struct Status {
     archive_height: Option<u64>,
+    finalized_block: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct Heights {
+    archive: Option<BlockNumber>,
+    finalized: Option<BlockNumber>,
 }
 
 /// The streams of one `/query` answer.
@@ -154,13 +169,12 @@ impl DatalakeClient {
         }
     }
 
-    /// The highest block the datalake answers queries for (cached briefly).
-    pub async fn archive_height(&self) -> anyhow::Result<Option<BlockNumber>> {
+    async fn heights(&self) -> anyhow::Result<Heights> {
         let mut cached = self.height.lock().await;
-        if let Some((at, height)) = *cached
+        if let Some((at, heights)) = *cached
             && at.elapsed() < HEIGHT_TTL
         {
-            return Ok(height);
+            return Ok(heights);
         }
         let url = format!("{}/status", self.settings.url.trim_end_matches('/'));
         let status: Status = self
@@ -170,11 +184,31 @@ impl DatalakeClient {
             .error_for_status()?
             .json()
             .await?;
-        let height = status
-            .archive_height
-            .map(|h| BlockNumber::try_from(h).unwrap_or(BlockNumber::MAX));
-        *cached = Some((Instant::now(), height));
-        Ok(height)
+        let number =
+            |h: Option<u64>| h.map(|h| BlockNumber::try_from(h).unwrap_or(BlockNumber::MAX));
+        let heights = Heights {
+            archive: number(status.archive_height),
+            finalized: number(status.finalized_block),
+        };
+        *cached = Some((Instant::now(), heights));
+        Ok(heights)
+    }
+
+    /// The highest block the datalake answers queries for (cached briefly).
+    pub async fn archive_height(&self) -> anyhow::Result<Option<BlockNumber>> {
+        Ok(self.heights().await?.archive)
+    }
+
+    /// The highest block the datalake reports as finalized, when `trust_finalized` is set.
+    pub async fn finalized_height(&self) -> anyhow::Result<Option<BlockNumber>> {
+        if !self.settings.trust_finalized {
+            return Ok(None);
+        }
+        let heights = self.heights().await?;
+        Ok(match (heights.finalized, heights.archive) {
+            (Some(f), Some(a)) => Some(f.min(a)),
+            _ => None,
+        })
     }
 
     async fn query_once(&self, body: &serde_json::Value) -> anyhow::Result<Answer> {
