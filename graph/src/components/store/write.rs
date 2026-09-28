@@ -1002,6 +1002,40 @@ impl<'a> WriteChunk<'a> {
         }
     }
 
+    /// Splits this chunk into chunks of at most `size` writes, in order.
+    pub fn split(&self, size: usize) -> Vec<Self> {
+        let size = size.max(1);
+        let mut chunks = Vec::new();
+        let mut start = self.position;
+        let mut position = self.position;
+        let mut in_chunk = 0;
+        let mut total = 0;
+        while total < self.chunk_size && position < self.group.rows.len() {
+            if self.group.rows[position].as_write().is_some() {
+                in_chunk += 1;
+                total += 1;
+            }
+            position += 1;
+            if in_chunk == size {
+                chunks.push(WriteChunk {
+                    group: self.group,
+                    chunk_size: size,
+                    position: start,
+                });
+                start = position;
+                in_chunk = 0;
+            }
+        }
+        if in_chunk > 0 {
+            chunks.push(WriteChunk {
+                group: self.group,
+                chunk_size: in_chunk,
+                position: start,
+            });
+        }
+        chunks
+    }
+
     /// Return a vector of `WriteChunk`s each containing a single write
     pub fn as_single_writes(&self) -> Vec<Self> {
         (0..self.len())

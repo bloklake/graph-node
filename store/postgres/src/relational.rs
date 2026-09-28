@@ -65,7 +65,7 @@ use crate::{
     primary::{Namespace, Site},
     relational_queries::{
         ClampRangeQuery, EntityData, EntityDeletion, FilterCollection, FilterQuery, FindManyQuery,
-        FindRangeQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
+        FindRangeQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery, UnnestInsertQuery,
     },
 };
 use graph::components::store::{AttributeNames, DerivedEntityQuery};
@@ -765,15 +765,44 @@ impl Layout {
         let _section = stopwatch.start_section("insert_modification_insert_query");
 
         // We insert the entities in chunks to make sure each operation does
-        // not exceed the maximum number of bindings allowed in queries
-        let chunk_size = InsertQuery::chunk_size(table);
+        // not exceed the maximum number of bindings allowed in queries; tables
+        // with scalar columns only are written with one array per column
+        let unnest = UnnestInsertQuery::supports(table);
+        let chunk_size = if unnest {
+            UnnestInsertQuery::CHUNK_SIZE
+        } else {
+            InsertQuery::chunk_size(table)
+        };
         let mut affected_rows: usize = 0;
         let mut expected_rows: usize = 0;
         for chunk in group.write_chunks(chunk_size) {
             // Empty chunks would lead to invalid SQL
             if !chunk.is_empty() {
                 expected_rows += chunk.len();
-                match InsertQuery::new(table, &chunk)?.execute(conn).await {
+                let result = match unnest
+                    .then(|| UnnestInsertQuery::new(table, &chunk))
+                    .flatten()
+                {
+                    Some(query) => query.execute(conn).await,
+                    None if unnest => {
+                        // Values `InsertQuery` handles or reports (the chunk may be larger
+                        // than it takes at once).
+                        let mut count = 0;
+                        let mut result = Ok(0);
+                        for small in chunk.split(InsertQuery::chunk_size(table)) {
+                            match InsertQuery::new(table, &small)?.execute(conn).await {
+                                Ok(n) => count += n,
+                                Err(e) => {
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                        result.map(|_| count)
+                    }
+                    None => InsertQuery::new(table, &chunk)?.execute(conn).await,
+                };
+                match result {
                     Ok(count) => {
                         affected_rows += count;
                     }

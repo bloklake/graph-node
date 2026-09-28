@@ -2594,6 +2594,260 @@ impl<'a> QueryId for InsertQuery<'a> {
 
 impl<'a, Conn> RunQueryDsl<Conn> for InsertQuery<'a> {}
 
+/// One column's values for an `UnnestInsertQuery`, converted the way `SqlValue` converts them.
+#[derive(Debug)]
+enum ColumnValues<'a> {
+    Text(Vec<Option<&'a str>>),
+    Int(Vec<Option<i32>>),
+    Int8(Vec<Option<i64>>),
+    Bool(Vec<Option<bool>>),
+    Binary(Vec<Option<std::borrow::Cow<'a, [u8]>>>),
+    /// Decimal strings, cast to `numeric` server-side like single values are.
+    Numeric(Vec<Option<String>>),
+    Timestamp(Vec<Option<&'a chrono::DateTime<chrono::Utc>>>),
+}
+
+impl<'a> ColumnValues<'a> {
+    fn new(column_type: &ColumnType, len: usize) -> Option<Self> {
+        Some(match column_type {
+            ColumnType::String | ColumnType::Enum(_) => Self::Text(Vec::with_capacity(len)),
+            ColumnType::Int => Self::Int(Vec::with_capacity(len)),
+            ColumnType::Int8 => Self::Int8(Vec::with_capacity(len)),
+            ColumnType::Boolean => Self::Bool(Vec::with_capacity(len)),
+            ColumnType::Bytes => Self::Binary(Vec::with_capacity(len)),
+            ColumnType::BigInt | ColumnType::BigDecimal => Self::Numeric(Vec::with_capacity(len)),
+            ColumnType::Timestamp => Self::Timestamp(Vec::with_capacity(len)),
+            ColumnType::TSVector(_) => return None,
+        })
+    }
+
+    /// Adds `value`; `None` when it is not a value this column's type takes (the caller then
+    /// uses `InsertQuery`, which reports such mismatches).
+    fn push(&mut self, value: &'a Value) -> Option<()> {
+        use ColumnValues as C;
+        match (self, value) {
+            (C::Text(v), Value::Null) => v.push(None),
+            (C::Text(v), Value::String(s)) => v.push(Some(s.as_str())),
+            (C::Int(v), Value::Null) => v.push(None),
+            (C::Int(v), Value::Int(i)) => v.push(Some(*i)),
+            (C::Int8(v), Value::Null) => v.push(None),
+            (C::Int8(v), Value::Int8(i)) => v.push(Some(*i)),
+            (C::Int8(v), Value::String(s)) => v.push(Some(s.parse().ok()?)),
+            (C::Bool(v), Value::Null) => v.push(None),
+            (C::Bool(v), Value::Bool(b)) => v.push(Some(*b)),
+            (C::Binary(v), Value::Null) => v.push(None),
+            (C::Binary(v), Value::Bytes(b)) => v.push(Some(b.as_slice().into())),
+            (C::Binary(v), Value::String(s)) => {
+                let bytes = scalar::Bytes::from_str(s).ok()?;
+                v.push(Some(bytes.as_slice().to_vec().into()))
+            }
+            (C::Numeric(v), Value::Null) => v.push(None),
+            (C::Numeric(v), Value::BigInt(i)) => v.push(Some(i.to_string())),
+            (C::Numeric(v), Value::BigDecimal(d)) => v.push(Some(d.to_string())),
+            (C::Timestamp(v), Value::Null) => v.push(None),
+            (C::Timestamp(v), Value::Timestamp(ts)) => v.push(Some(&ts.0)),
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn walk_ast<'b>(
+        &'b self,
+        column_type: &ColumnType,
+        out: &mut AstPass<'_, 'b, Pg>,
+    ) -> QueryResult<()> {
+        use ColumnValues as C;
+        use diesel::sql_types::Nullable;
+        match self {
+            C::Text(v) => {
+                out.push_bind_param::<Array<Nullable<Text>>, _>(v)?;
+                match column_type {
+                    ColumnType::Enum(enum_type) => {
+                        out.push_sql("::text[]::");
+                        out.push_sql(enum_type.name.as_str());
+                        out.push_sql("[]");
+                    }
+                    _ => out.push_sql("::text[]"),
+                }
+            }
+            C::Int(v) => {
+                out.push_bind_param::<Array<Nullable<Integer>>, _>(v)?;
+                out.push_sql("::int4[]");
+            }
+            C::Int8(v) => {
+                out.push_bind_param::<Array<Nullable<Int8>>, _>(v)?;
+                out.push_sql("::int8[]");
+            }
+            C::Bool(v) => {
+                out.push_bind_param::<Array<Nullable<Bool>>, _>(v)?;
+                out.push_sql("::bool[]");
+            }
+            C::Binary(v) => {
+                out.push_bind_param::<Array<Nullable<Binary>>, _>(v)?;
+                out.push_sql("::bytea[]");
+            }
+            C::Numeric(v) => {
+                out.push_bind_param::<Array<Nullable<Text>>, _>(v)?;
+                out.push_sql("::text[]::numeric[]");
+            }
+            C::Timestamp(v) => {
+                out.push_bind_param::<Array<Nullable<Timestamptz>>, _>(v)?;
+                out.push_sql("::timestamptz[]");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Inserts a chunk of rows with one parameter per column, each an array of the rows' values,
+/// unnested server-side:
+///
+///   insert into schema.table(a, b, block$, vid)
+///   select * from unnest($1::text[], $2::int4[], $3::int4[], $4::int8[])
+///
+/// Unlike `InsertQuery`'s `values (..), (..)` with a bind variable per value, the statement
+/// does not grow with the chunk, so Postgres parses and plans the same short statement for
+/// every chunk. Only tables whose columns are all scalars qualify (`UnnestInsertQuery::new`
+/// returns `None` otherwise); the rows are the same `InsertQuery` would write.
+#[derive(Debug)]
+pub struct UnnestInsertQuery<'a> {
+    table: &'a Table,
+    columns: Vec<&'a Column>,
+    values: Vec<ColumnValues<'a>>,
+    blocks: Vec<BlockNumber>,
+    ends: Vec<Option<BlockNumber>>,
+    causality_regions: Vec<CausalityRegion>,
+    vids: Vec<i64>,
+}
+
+impl<'a> UnnestInsertQuery<'a> {
+    /// Rows per statement; arrays are not limited by the number of bind variables.
+    pub const CHUNK_SIZE: usize = 20_000;
+
+    /// Whether `table` can be written with this query.
+    pub fn supports(table: &Table) -> bool {
+        table.columns.iter().all(|column| {
+            !column.is_list()
+                && column.fulltext_fields.is_none()
+                && !matches!(column.column_type, ColumnType::TSVector(_))
+        })
+    }
+
+    pub fn new(table: &'a Table, rows: &'a WriteChunk<'a>) -> Option<UnnestInsertQuery<'a>> {
+        if !Self::supports(table) {
+            return None;
+        }
+        // Missing non-nullable values are reported by `InsertQuery`.
+        let len = rows.len();
+        for row in rows {
+            for column in table.columns.iter() {
+                if !column.is_nullable() && !row.entity.contains_key(&column.field) {
+                    return None;
+                }
+            }
+        }
+        let columns = InsertQuery::unique_columns(table, rows);
+        let mut values = columns
+            .iter()
+            .map(|column| ColumnValues::new(&column.column_type, len))
+            .collect::<Option<Vec<_>>>()?;
+        let mut blocks = Vec::with_capacity(len);
+        let mut ends = Vec::with_capacity(len);
+        let mut causality_regions = Vec::with_capacity(len);
+        let mut vids = Vec::with_capacity(len);
+        for row in rows {
+            for (column, column_values) in columns.iter().zip(values.iter_mut()) {
+                column_values.push(row.entity.get(&column.field).unwrap_or(&NULL))?;
+            }
+            blocks.push(row.block);
+            ends.push(row.end);
+            causality_regions.push(row.causality_region);
+            vids.push(row.entity.vid());
+        }
+        Some(UnnestInsertQuery {
+            table,
+            columns,
+            values,
+            blocks,
+            ends,
+            causality_regions,
+            vids,
+        })
+    }
+}
+
+impl<'a> QueryFragment<Pg> for UnnestInsertQuery<'a> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        use diesel::sql_types::Nullable;
+        let out = &mut out;
+        let has_vid_seq = self.table.object.has_vid_seq();
+
+        out.push_sql("insert into ");
+        out.push_sql(self.table.qualified_name.as_str());
+        out.push_sql("(");
+        for &column in &self.columns {
+            out.push_identifier(column.name.as_str())?;
+            out.push_sql(", ");
+        }
+        out.push_sql(self.table.block_column().as_str());
+        if self.table.has_causality_region {
+            out.push_sql(", ");
+            out.push_sql(CAUSALITY_REGION_COLUMN);
+        }
+        if has_vid_seq {
+            out.push_sql(", vid");
+        }
+        out.push_sql(")\nselect ");
+        for i in 0..self.columns.len() {
+            out.push_sql(&format!("c{i}, "));
+        }
+        if self.table.immutable {
+            out.push_sql("b$");
+        } else {
+            // `[block, end)`, or `[block, ∞)` without an end: what `BlockRange` binds.
+            out.push_sql("int4range(b$, e$)");
+        }
+        if self.table.has_causality_region {
+            out.push_sql(", r$");
+        }
+        if has_vid_seq {
+            out.push_sql(", v$");
+        }
+        out.push_sql("\n  from unnest(");
+        for (column, values) in self.columns.iter().zip(&self.values) {
+            values.walk_ast(&column.column_type, out)?;
+            out.push_sql(", ");
+        }
+        out.push_bind_param::<Array<Integer>, _>(&self.blocks)?;
+        out.push_sql("::int4[], ");
+        out.push_bind_param::<Array<Nullable<Integer>>, _>(&self.ends)?;
+        out.push_sql("::int4[], ");
+        out.push_bind_param::<Array<Integer>, _>(&self.causality_regions)?;
+        out.push_sql("::int4[], ");
+        out.push_bind_param::<Array<BigInt>, _>(&self.vids)?;
+        out.push_sql("::int8[]) as x(");
+        for i in 0..self.columns.len() {
+            out.push_sql(&format!("c{i}, "));
+        }
+        out.push_sql("b$, e$, r$, v$)");
+
+        if self.table.immutable && self.table.skip_duplicates {
+            out.push_sql("\n ON CONFLICT (");
+            out.push_identifier(self.table.primary_key().name.as_str())?;
+            out.push_sql(") DO NOTHING");
+        }
+        Ok(())
+    }
+}
+
+impl<'a> QueryId for UnnestInsertQuery<'a> {
+    type QueryId = ();
+
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<'a, Conn> RunQueryDsl<Conn> for UnnestInsertQuery<'a> {}
+
 #[derive(Debug, Clone)]
 pub struct ConflictingEntitiesQuery<'a> {
     tables: Vec<&'a Table>,
