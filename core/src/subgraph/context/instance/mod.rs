@@ -38,6 +38,11 @@ pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
     /// Maps the hash of a module to a channel to the thread in which the module is instantiated.
     module_cache: HashMap<[u8; 32], Sender<T::Req>>,
 
+    /// The hash of each module buffer seen, by address; data sources created from a template
+    /// share its buffer, so it is hashed once rather than once per data source. Holding the
+    /// buffer keeps its address from being reused for other bytes.
+    module_hashes: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])>,
+
     /// This manages the sequence of causality regions for the subgraph.
     causality_region_seq: CausalityRegionSeq,
 }
@@ -86,6 +91,7 @@ where
             subgraph_hosts: OnchainHosts::new(),
             offchain_hosts: OffchainHosts::new(),
             module_cache: HashMap::new(),
+            module_hashes: HashMap::new(),
             templates,
             host_metrics,
             causality_region_seq,
@@ -104,7 +110,20 @@ where
         };
 
         let mapping_request_sender = {
-            let module_hash = alloy::primitives::keccak256(module_bytes.as_ref()).0;
+            let module_hash = match self
+                .module_hashes
+                .get(&(Arc::as_ptr(&module_bytes) as usize))
+            {
+                Some((_, hash)) => *hash,
+                None => {
+                    let hash = alloy::primitives::keccak256(module_bytes.as_ref()).0;
+                    self.module_hashes.insert(
+                        Arc::as_ptr(&module_bytes) as usize,
+                        (module_bytes.cheap_clone(), hash),
+                    );
+                    hash
+                }
+            };
             if let Some(sender) = self.module_cache.get(&module_hash) {
                 sender.clone()
             } else {

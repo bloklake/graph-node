@@ -148,7 +148,7 @@ where
 
         let speculation = match (ENV_VARS.mappings.speculation_threads, data_source.runtime()) {
             (0, _) | (_, None) => None,
-            (_, Some(bytes)) => crate::mapping::registered_module(bytes.as_ref())
+            (_, Some(bytes)) => crate::mapping::registered_module(&bytes)
                 .map(|module| (module, Arc::new(metrics.speculative()))),
         };
 

@@ -485,6 +485,36 @@ impl From<EthereumLogFilter> for Vec<LogFilter> {
 }
 
 impl EthereumLogFilter {
+    /// True when every log `other` matches is also matched by `self` (a sufficient check:
+    /// `self` must name each of `other`'s events for any address, or for the same address).
+    pub fn covers(&self, other: &EthereumLogFilter) -> bool {
+        let covers_event = |contract: Option<Address>, sig: &B256| {
+            self.wildcard_events.contains_key(sig)
+                || contract.is_some_and(|c| {
+                    self.contracts_and_events_graph
+                        .contains_edge(LogFilterNode::Contract(c), LogFilterNode::Event(*sig))
+                })
+        };
+        other
+            .contracts_and_events_graph
+            .all_edges()
+            .all(|(a, b, _)| match (a, b) {
+                (LogFilterNode::Contract(c), LogFilterNode::Event(e))
+                | (LogFilterNode::Event(e), LogFilterNode::Contract(c)) => {
+                    covers_event(Some(c), &e)
+                }
+                _ => false,
+            })
+            && other
+                .wildcard_events
+                .iter()
+                .all(|(sig, _)| self.wildcard_events.contains_key(sig))
+            && other.events_with_topic_filters.iter().all(|(e, _)| {
+                covers_event(e.address, &e.signature)
+                    || self.events_with_topic_filters.contains_key(e)
+            })
+    }
+
     /// Check if this filter matches the specified `Log`.
     pub fn matches(&self, log: &Log) -> bool {
         // First topic should be event sig

@@ -39,7 +39,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::adapter::{EthGetLogsFilter, TriggerFilter};
+use crate::adapter::{EthGetLogsFilter, EthereumLogFilter, TriggerFilter};
 
 /// `[chains.<name>.datalake]` in the node config.
 #[derive(Clone, Debug, PartialEq, Deserialize, serde::Serialize)]
@@ -90,7 +90,20 @@ pub struct DatalakeClient {
     height: Mutex<Option<(Instant, Option<BlockNumber>)>>,
     /// Scans started ahead of time, by filter fingerprint and first block.
     prefetched: Mutex<HashMap<(u64, BlockNumber), JoinHandle<anyhow::Result<Scanned>>>>,
+    /// The last scans' logs, to answer re-scans of single blocks (for data sources created in
+    /// the block) without a request.
+    recent: std::sync::Mutex<std::collections::VecDeque<RecentScan>>,
 }
+
+struct RecentScan {
+    from: BlockNumber,
+    to: BlockNumber,
+    filter: EthereumLogFilter,
+    logs: HashMap<u64, Vec<Arc<Log>>>,
+}
+
+/// Scans remembered for `recent_logs`.
+const RECENT_SCANS: usize = 8;
 
 impl std::fmt::Debug for DatalakeClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,6 +139,7 @@ impl DatalakeClient {
             http,
             height: Mutex::new(None),
             prefetched: Mutex::new(HashMap::new()),
+            recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -699,7 +713,7 @@ fn fingerprint(filters: &[serde_json::Value]) -> u64 {
 /// Blocks and logs of one scanned range.
 pub struct Scanned {
     /// Every block with a matched log, and the last block of the range (possibly without logs).
-    pub blocks: Vec<(Arc<LightEthereumBlock>, Vec<Log>)>,
+    pub blocks: Vec<(Arc<LightEthereumBlock>, Vec<Arc<Log>>)>,
     /// Last block the scan covers.
     pub to: BlockNumber,
 }
@@ -821,7 +835,56 @@ impl DatalakeClient {
             prefetched.retain(|(k, _), _| *k == key);
             prefetched.insert((key, next), handle);
         }
+        self.remember(from, &scanned, filter);
         Ok(Some(scanned))
+    }
+
+    fn remember(&self, from: BlockNumber, scanned: &Scanned, filter: &TriggerFilter) {
+        let logs = scanned
+            .blocks
+            .iter()
+            .filter(|(_, logs)| !logs.is_empty())
+            .map(|(block, logs)| (block.number_u64(), logs.clone()))
+            .collect();
+        let mut recent = self.recent.lock().unwrap();
+        recent.push_back(RecentScan {
+            from,
+            to: scanned.to,
+            filter: filter.log.clone(),
+            logs,
+        });
+        while recent.len() > RECENT_SCANS {
+            recent.pop_front();
+        }
+    }
+
+    /// The logs `filter` matches in block `number`, from a recent scan whose filter included
+    /// everything `filter` asks for; `None` when no such scan covered the block.
+    pub fn recent_logs(
+        &self,
+        number: BlockNumber,
+        filter: &EthereumLogFilter,
+    ) -> Option<Vec<Arc<Log>>> {
+        let recent = self.recent.lock().unwrap();
+        let scan = recent
+            .iter()
+            .rev()
+            .find(|scan| scan.from <= number && number <= scan.to)?;
+        if !scan.filter.covers(filter) {
+            return None;
+        }
+        let number = u64::try_from(number).ok()?;
+        Some(
+            scan.logs
+                .get(&number)
+                .map(|logs| {
+                    logs.iter()
+                        .filter(|log| filter.matches(log))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
     }
 
     /// Cuts a prefetched scan back to end at `to`, which must then be in it.
@@ -911,12 +974,12 @@ impl DatalakeClient {
             }
         }
 
-        let mut logs_by_block: HashMap<u64, Vec<Log>> = HashMap::new();
+        let mut logs_by_block: HashMap<u64, Vec<Arc<Log>>> = HashMap::new();
         for log in matched {
             logs_by_block
                 .entry(log.block_number.unwrap_or_default())
                 .or_default()
-                .push(log);
+                .push(Arc::new(log));
         }
         let blocks = blocks
             .into_iter()
@@ -961,7 +1024,7 @@ impl DatalakeClient {
 }
 
 /// Transaction hashes of logs that need a receipt, by block hash.
-pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Log]) -> HashMap<B256, HashSet<B256>> {
+pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Arc<Log>]) -> HashMap<B256, HashSet<B256>> {
     let mut out: HashMap<B256, HashSet<B256>> = HashMap::new();
     for log in logs {
         let Some(signature) = log.topics().first() else {

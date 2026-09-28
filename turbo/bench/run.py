@@ -109,7 +109,7 @@ def digest(db, end):
     """Canonical digest of every entity table: rows alive or created at/below `end`."""
     schema = psql("select name from deployment_schemas order by id desc limit 1", db, True).strip()
     tables = psql(f"select table_name from information_schema.tables where table_schema = '{schema}' "
-                  "and table_name not like 'poi2$%' and table_name not in ('data_sources$') order by 1", db, True).split()
+                  "and table_name not like 'poi2$%' order by 1", db, True).split()
     h = hashlib.sha256()
     rows = {}
     for t in tables:
@@ -124,7 +124,11 @@ def digest(db, end):
         else:
             where = "true"
         sel = ", ".join(f'"{c}"' for c in data)
-        out = psql(f'select {sel} from "{schema}"."{t}" where {where} order by id', db, True)
+        # Data sources have no id; their creation order (vid) matters.
+        order = "id"
+        if t == "data_sources$":
+            order, where = "vid", f"lower(block_range) <= {end}"
+        out = psql(f'select {sel} from "{schema}"."{t}" where {where} order by {order}', db, True)
         h.update(t.encode() + b"\0" + out.encode())
         rows[t] = out.count("\n")
     return h.hexdigest()[:16], rows
@@ -142,7 +146,7 @@ def run_once(args, run_no):
     if args.datalake:
         url = DATALAKES[args.case] if args.datalake == "auto" else args.datalake
         datalake = f'datalake = {{ url = "{url}" }}\n'
-    cfg = work / f"{args.case}.toml"
+    cfg = work / f"{args.case}{args.db_suffix}.toml"
     cfg.write_text(f"""[store]
 [store.primary]
 connection = "postgresql://graph:graph@localhost:55433/{db}"

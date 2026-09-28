@@ -124,17 +124,18 @@ where
 }
 
 /// Compiled modules by the keccak hash of their bytes, so every host running the same module
-/// finds it for speculative runs; `POINTERS` remembers which byte buffers hash to what.
+/// finds it for speculative runs. `buffers` remembers the hash of each module buffer hosts were
+/// built from (holding the buffer, so its address is not reused for other bytes).
 struct ModuleRegistry {
     by_hash: HashMap<[u8; 32], std::sync::Weak<ValidModule>>,
-    pointers: HashMap<(usize, usize), [u8; 32]>,
+    buffers: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])>,
 }
 
 static MODULES: std::sync::LazyLock<std::sync::Mutex<ModuleRegistry>> =
     std::sync::LazyLock::new(|| {
         std::sync::Mutex::new(ModuleRegistry {
             by_hash: HashMap::new(),
-            pointers: HashMap::new(),
+            buffers: HashMap::new(),
         })
     });
 
@@ -149,25 +150,29 @@ fn register_module(raw_module: &[u8], module: &Arc<ValidModule>) {
         .by_hash
         .retain(|_, module| module.strong_count() > 0);
     modules.by_hash.insert(hash, Arc::downgrade(module));
-    modules
-        .pointers
-        .insert((raw_module.as_ptr() as usize, raw_module.len()), hash);
 }
 
 /// The module compiled from these bytes, if it is still alive.
-pub(crate) fn registered_module(raw_module: &[u8]) -> Option<Arc<ValidModule>> {
-    let pointer = (raw_module.as_ptr() as usize, raw_module.len());
-    let known = MODULES.lock().unwrap().pointers.get(&pointer).copied();
+pub(crate) fn registered_module(raw_module: &Arc<Vec<u8>>) -> Option<Arc<ValidModule>> {
+    let address = Arc::as_ptr(raw_module) as usize;
+    let known = MODULES
+        .lock()
+        .unwrap()
+        .buffers
+        .get(&address)
+        .map(|(_, hash)| *hash);
     let hash = match known {
         Some(hash) => hash,
         None => {
             let hash = module_hash(raw_module);
             let mut modules = MODULES.lock().unwrap();
-            // Keep the alias table from growing without bound as data sources come and go.
-            if modules.pointers.len() > 100_000 {
-                modules.pointers.clear();
+            // Keep the table from growing without bound as data sources come and go.
+            if modules.buffers.len() > 10_000 {
+                modules.buffers.clear();
             }
-            modules.pointers.insert(pointer, hash);
+            modules
+                .buffers
+                .insert(address, (raw_module.cheap_clone(), hash));
             hash
         }
     };

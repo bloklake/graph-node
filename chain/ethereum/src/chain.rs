@@ -1086,6 +1086,23 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         )
         .await?;
 
+        // A block the datalake scanned has the logs a new data source in it matches already,
+        // when the scan's filter included that data source's events (static filters).
+        if let (Some(datalake), BlockFinality::Final(light)) = (&self.datalake, &block)
+            && filter.call.is_empty()
+            && filter.block.is_empty()
+            && let Some(logs) = datalake.recent_logs(light.number(), &filter.log)
+            && crate::datalake::receipts_needed(filter, &logs.iter().collect::<Vec<_>>()).is_empty()
+        {
+            let triggers = logs
+                .into_iter()
+                .map(|log| {
+                    crate::trigger::EthereumTrigger::Log(crate::trigger::LogRef::FullLog(log, None))
+                })
+                .collect();
+            return Ok(BlockWithTriggers::new(block, triggers, logger));
+        }
+
         match &block {
             BlockFinality::Final(_) => {
                 let adapter = self
@@ -1318,8 +1335,7 @@ impl TriggersAdapter {
                             .transaction_hash
                             .and_then(|tx| receipts.get(&tx).cloned());
                         crate::trigger::EthereumTrigger::Log(crate::trigger::LogRef::FullLog(
-                            Arc::new(log),
-                            receipt,
+                            log, receipt,
                         ))
                     })
                     .collect();
