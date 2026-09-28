@@ -109,7 +109,7 @@ def digest(db, end):
     """Canonical digest of every entity table: rows alive or created at/below `end`."""
     schema = psql("select name from deployment_schemas order by id desc limit 1", db, True).strip()
     tables = psql(f"select table_name from information_schema.tables where table_schema = '{schema}' "
-                  "and table_name not like 'poi2$%' order by 1", db, True).split()
+                  "order by 1", db, True).split()
     h = hashlib.sha256()
     rows = {}
     for t in tables:
@@ -128,6 +128,10 @@ def digest(db, end):
         order = "id"
         if t == "data_sources$":
             order, where = "vid", f"lower(block_range) <= {end}"
+        if t == "poi2$":
+            # Every block's proof of indexing, not just the latest.
+            sel += ", lower(block_range)"
+            order, where = "id, lower(block_range)", f"lower(block_range) <= {end}"
         out = psql(f'select {sel} from "{schema}"."{t}" where {where} order by {order}', db, True)
         h.update(t.encode() + b"\0" + out.encode())
         rows[t] = out.count("\n")
