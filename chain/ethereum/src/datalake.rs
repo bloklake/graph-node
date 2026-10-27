@@ -19,8 +19,7 @@ use arrow::array::{
     Array, BinaryArray, FixedSizeBinaryArray, ListArray, StructArray, UInt8Array, UInt32Array,
     UInt64Array,
 };
-use arrow::buffer::Buffer;
-use arrow::ipc::reader::StreamDecoder;
+use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use graph::blockchain::BlockPtr;
 use graph::components::ethereum::{AnyBlock, AnyTransaction, LightEthereumBlock};
@@ -102,6 +101,8 @@ pub struct DatalakeClient {
     /// The last scans' logs, to answer re-scans of single blocks (for data sources created in
     /// the block) without a request.
     recent: std::sync::Mutex<std::collections::VecDeque<RecentScan>>,
+    /// Whether the chain's missing fields (`bl.unavailable_fields`) were logged already.
+    warned_unavailable: std::sync::atomic::AtomicBool,
 }
 
 struct RecentScan {
@@ -147,6 +148,8 @@ struct Answer {
     blocks: Vec<RecordBatch>,
     /// First block the answer does not cover.
     next_block: BlockNumber,
+    /// `bl.unavailable_fields`: selected fields the chain doesn't have (their columns are null).
+    unavailable_fields: Vec<String>,
 }
 
 impl DatalakeClient {
@@ -161,6 +164,7 @@ impl DatalakeClient {
             height: Mutex::new(None),
             prefetched: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            warned_unavailable: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -225,25 +229,7 @@ impl DatalakeClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("datalake answered {status}: {text}"));
         }
-        let header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        };
-        let streams = header("x-bl-streams").unwrap_or_default();
-        let next_block: BlockNumber = header("x-bl-next-block")
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| anyhow!("datalake answer without X-BL-Next-Block"))?;
-        let body = resp.bytes().await?;
-        let mut streams = decode_streams(body, &streams)?;
-        let mut take = |name: &str| streams.remove(name).unwrap_or_default();
-        Ok(Answer {
-            transactions: take("transactions"),
-            logs: take("logs"),
-            blocks: take("blocks"),
-            next_block,
-        })
+        decode_answer(&resp.bytes().await?)
     }
 
     async fn query(&self, logger: &Logger, body: &serde_json::Value) -> anyhow::Result<Answer> {
@@ -251,7 +237,17 @@ impl DatalakeClient {
         let mut attempt = 1;
         loop {
             match self.query_once(body).await {
-                Ok(answer) => return Ok(answer),
+                Ok(answer) => {
+                    if !answer.unavailable_fields.is_empty()
+                        && !self
+                            .warned_unavailable
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(logger, "Datalake chain lacks selected fields; they read as null";
+                            "fields" => answer.unavailable_fields.join(","));
+                    }
+                    return Ok(answer);
+                }
                 Err(e) if attempt < ATTEMPTS => {
                     warn!(logger, "Datalake query failed, retrying";
                         "attempt" => attempt, "error" => format!("{e:#}"));
@@ -265,35 +261,110 @@ impl DatalakeClient {
     }
 }
 
-/// Splits a body of back-to-back Arrow IPC streams (named by `X-BL-Streams`, in order).
-fn decode_streams(
-    body: graph::bytes::Bytes,
-    names: &str,
-) -> anyhow::Result<HashMap<String, Vec<RecordBatch>>> {
-    let mut buffer = Buffer::from(body);
-    let mut out = HashMap::new();
-    for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-        let mut decoder = StreamDecoder::new();
-        let mut batches = Vec::new();
-        loop {
-            if buffer.is_empty() {
-                decoder
-                    .finish()
-                    .map_err(|e| anyhow!("datalake stream `{name}` is truncated: {e}"))?;
-                break;
-            }
-            match decoder.decode(&mut buffer) {
-                Ok(Some(batch)) => batches.push(batch),
-                Ok(None) => {}
-                // The decoder refuses to read past an end-of-stream marker: the next stream
-                // starts here.
-                Err(_) if decoder.finish().is_ok() => break,
-                Err(e) => return Err(anyhow!("datalake stream `{name}`: {e}")),
-            }
+/// Splits a body of back-to-back Arrow IPC streams at their end-of-stream markers. A reader
+/// takes a clean end of input for the end of a stream, so a body cut between two messages would
+/// otherwise read as complete.
+fn split_streams(body: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+    let word = |at: usize| {
+        body.get(at..at + 4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let mut out = Vec::new();
+    let (mut start, mut offset) = (0, 0);
+    while let Some(mut length) = word(offset) {
+        // A message is `0xFFFFFFFF`, metadata length, metadata, body; pre-1.0 writers omit the
+        // continuation marker. A zero length is the end-of-stream marker.
+        let mut prefix = 4;
+        if length == -1 {
+            prefix = 8;
+            length = word(offset + 4).ok_or_else(|| anyhow!("datalake answer is truncated"))?;
         }
-        out.insert(name.to_string(), batches);
+        if length == 0 {
+            offset += prefix;
+            out.push(&body[start..offset]);
+            start = offset;
+            continue;
+        }
+        let metadata = body
+            .get(offset + prefix..offset + prefix + length as usize)
+            .ok_or_else(|| anyhow!("datalake answer is truncated"))?;
+        let message = arrow::ipc::root_as_message(metadata)
+            .map_err(|e| anyhow!("datalake answer has an invalid Arrow message: {e}"))?;
+        offset += prefix + length as usize + message.bodyLength() as usize;
+    }
+    if start != body.len() {
+        return Err(anyhow!(
+            "datalake answer is truncated: Arrow stream without end-of-stream marker"
+        ));
     }
     Ok(out)
+}
+
+/// Decodes a `/query` answer. Every stream's schema metadata repeats the answer's `bl.*` keys:
+/// `bl.streams` names every stream in order, so a body that ends cleanly after fewer streams is
+/// truncated; `bl.next_block` is the first block not covered.
+fn decode_answer(body: &[u8]) -> anyhow::Result<Answer> {
+    let streams = split_streams(body)?;
+    if streams.is_empty() {
+        return Err(anyhow!("datalake answer is truncated: no Arrow stream"));
+    }
+    let mut answer = Answer::default();
+    let mut names: Vec<String> = Vec::new();
+    for (i, stream) in streams.iter().enumerate() {
+        let reader = StreamReader::try_new(std::io::Cursor::new(*stream), None)
+            .map_err(|e| anyhow!("datalake stream {i}: {e}"))?;
+        if i == 0 {
+            let schema = reader.schema();
+            let meta = schema.metadata();
+            let list = |key: &str| -> Vec<String> {
+                meta.get(key)
+                    .map(|s| {
+                        s.split(',')
+                            .filter(|n| !n.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            names = list("bl.streams");
+            if names.is_empty() {
+                return Err(anyhow!(
+                    "datalake answer without bl.* stream metadata; the server is older than \
+                     this client"
+                ));
+            }
+            if streams.len() > names.len() {
+                return Err(anyhow!(
+                    "datalake answer has {} streams, but bl.streams lists {}",
+                    streams.len(),
+                    names.len()
+                ));
+            }
+            answer.next_block = meta
+                .get("bl.next_block")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| anyhow!("datalake answer without bl.next_block"))?;
+            answer.unavailable_fields = list("bl.unavailable_fields");
+        }
+        let name = &names[i];
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("datalake stream `{name}`: {e}"))?;
+        match name.as_str() {
+            "transactions" => answer.transactions = batches,
+            "logs" => answer.logs = batches,
+            "blocks" => answer.blocks = batches,
+            other => return Err(anyhow!("unexpected datalake stream `{other}`")),
+        }
+    }
+    if streams.len() != names.len() {
+        return Err(anyhow!(
+            "datalake answer is truncated: expected {} streams, got {}",
+            names.len(),
+            streams.len()
+        ));
+    }
+    Ok(answer)
 }
 
 // --- Arrow columns ---------------------------------------------------------------------------
@@ -1162,4 +1233,168 @@ pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Arc<Log>]) -> HashMap<B2
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+
+    use super::decode_answer;
+
+    /// One Arrow stream of `rows` block numbers, with the server's `bl.*` metadata.
+    fn stream(row_type: &str, streams: &str, rows: &[u64], extra: &[(&str, &str)]) -> Vec<u8> {
+        let mut metadata = HashMap::from([
+            ("bl.row_type".to_owned(), row_type.to_owned()),
+            ("bl.streams".to_owned(), streams.to_owned()),
+            ("bl.next_block".to_owned(), "105".to_owned()),
+            ("bl.archive_height".to_owned(), "200".to_owned()),
+        ]);
+        for (k, v) in extra {
+            metadata.insert((*k).to_owned(), (*v).to_owned());
+        }
+        if streams.is_empty() {
+            metadata.remove("bl.streams");
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("block_number", DataType::UInt64, false)],
+            metadata,
+        ));
+        let mut out = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut out, &schema).unwrap();
+        if !rows.is_empty() {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt64Array::from(rows.to_vec()))],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        out
+    }
+
+    fn body(extra: &[(&str, &str)]) -> Vec<u8> {
+        let streams = "transactions,logs,blocks";
+        [
+            stream("transactions", streams, &[100, 101], extra),
+            stream("logs", streams, &[], extra),
+            stream("blocks", streams, &[100, 101, 102], extra),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn reads_streams_and_metadata() {
+        let answer = decode_answer(&body(&[])).unwrap();
+        assert_eq!(answer.next_block, 105);
+        let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
+        assert_eq!(rows(&answer.transactions), 2);
+        assert_eq!(rows(&answer.logs), 0);
+        assert_eq!(rows(&answer.blocks), 3);
+        assert!(answer.unavailable_fields.is_empty());
+
+        let answer = decode_answer(&body(&[(
+            "bl.unavailable_fields",
+            "blocks.total_difficulty,transactions.mint",
+        )]))
+        .unwrap();
+        assert_eq!(
+            answer.unavailable_fields,
+            ["blocks.total_difficulty", "transactions.mint"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_body_cut_anywhere() {
+        let full = body(&[]);
+        for cut in 0..full.len() {
+            assert!(decode_answer(&full[..cut]).is_err(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn rejects_old_servers_and_extra_streams() {
+        let old = stream("blocks", "", &[100], &[]);
+        let err = decode_answer(&old).err().unwrap().to_string();
+        assert!(err.contains("without bl.* stream metadata"), "{err}");
+
+        let extra = [body(&[]), stream("blocks", "blocks", &[], &[])].concat();
+        assert!(decode_answer(&extra).is_err());
+    }
+
+    /// Reads a live datalake and compares it with a JSON-RPC node. Opt-in:
+    ///
+    ///   DATALAKE_LIVE_URL=http://127.0.0.1:8090 DATALAKE_LIVE_RPC=http://127.0.0.1:8545 \
+    ///   DATALAKE_LIVE_BLOCKS=58600000:58600039 cargo test -p graph-chain-ethereum --lib \
+    ///   datalake::tests::live -- --ignored
+    #[graph::test]
+    #[ignore]
+    async fn live() {
+        use graph::prelude::{reqwest, serde_json, serde_json::json};
+        use graph::slog::{Discard, Logger, o};
+
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset"));
+        let (url, rpc) = (var("DATALAKE_LIVE_URL"), var("DATALAKE_LIVE_RPC"));
+        let blocks = var("DATALAKE_LIVE_BLOCKS");
+        let (from, to) = blocks.split_once(':').unwrap();
+        let (from, to): (i32, i32) = (from.parse().unwrap(), to.parse().unwrap());
+        let transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        let logger = Logger::root(Discard, o!());
+        let rpc_call = |method: &'static str, params: serde_json::Value| {
+            let rpc = rpc.clone();
+            async move {
+                let body: serde_json::Value = reqwest::Client::new()
+                    .post(rpc)
+                    .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert!(body.get("result").is_some(), "{method}: {body}");
+                body["result"].clone()
+            }
+        };
+
+        // Small pages, so the scan has to follow `bl.next_block`.
+        let client = super::DatalakeClient::new(
+            serde_json::from_value(json!({ "url": url, "max_objects": 200 })).unwrap(),
+        )
+        .unwrap();
+        assert!(client.archive_height().await.unwrap().unwrap() >= to);
+        let filters = [json!({ "topic0": [transfer] })];
+        let (mut logs, mut pages, mut next) = (0, 0, from);
+        while next <= to {
+            let scanned = client.fetch(&logger, next, to, &filters).await.unwrap();
+            logs += scanned.blocks.iter().map(|(_, l)| l.len()).sum::<usize>();
+            pages += 1;
+            next = scanned.to + 1;
+        }
+        assert!(pages > 1, "the answer was not paged");
+        let rpc_logs = rpc_call(
+            "eth_getLogs",
+            json!([{
+                "fromBlock": format!("{from:#x}"),
+                "toBlock": format!("{to:#x}"),
+                "topics": [transfer],
+            }]),
+        )
+        .await;
+        assert_eq!(logs, rpc_logs.as_array().unwrap().len());
+
+        let ptr = client.block_ptr(&logger, to).await.unwrap().unwrap();
+        let block = rpc_call("eth_getBlockByNumber", json!([format!("{to:#x}"), false])).await;
+        assert_eq!(
+            format!("{:#x}", ptr.hash.as_b256()),
+            block["hash"].as_str().unwrap()
+        );
+    }
 }
