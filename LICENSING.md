@@ -44,6 +44,100 @@ underlying client (`raw_client`) for binary `COPY`.
 
 ## Files Bloklake added or modified
 
-As both the Apache License 2.0 (section 4(b)) and the Elastic License 2.0 require, Bloklake
-states which files it changed: every file added or modified after `6838f4e`. List them with
+As both the Apache License 2.0 (section 4(b)) and the Elastic License 2.0 require, these are
+the files Bloklake changed since `6838f4e` (`A` = added, `M` = modified). Regenerate with
 `git diff --name-status 6838f4e HEAD -- . ':!vendor'`.
+
+```
+M  Cargo.lock
+M  Cargo.toml
+M  README.md
+M  chain/ethereum/Cargo.toml
+M  chain/ethereum/src/adapter.rs
+M  chain/ethereum/src/buffered_call_cache.rs
+M  chain/ethereum/src/chain.rs
+M  chain/ethereum/src/data_source.rs
+A  chain/ethereum/src/datalake.rs
+M  chain/ethereum/src/ethereum_adapter.rs
+M  chain/ethereum/src/ingestor.rs
+M  chain/ethereum/src/lib.rs
+M  chain/ethereum/src/polling_block_stream.rs
+M  core/src/amp_subgraph/runner/data_processing.rs
+M  core/src/subgraph/context/instance/hosts.rs
+M  core/src/subgraph/context/instance/mod.rs
+M  core/src/subgraph/instance_manager.rs
+M  core/src/subgraph/runner/mod.rs
+A  core/src/subgraph/runner/speculation.rs
+M  core/src/subgraph/state.rs
+M  graph/src/blockchain/block_stream.rs
+M  graph/src/blockchain/mod.rs
+M  graph/src/components/metrics/stopwatch.rs
+M  graph/src/components/store/entity_cache.rs
+M  graph/src/components/store/traits.rs
+M  graph/src/components/store/write.rs
+M  graph/src/components/subgraph/host.rs
+M  graph/src/components/subgraph/instance.rs
+M  graph/src/components/subgraph/mod.rs
+M  graph/src/components/subgraph/proof_of_indexing/mod.rs
+M  graph/src/components/subgraph/proof_of_indexing/online.rs
+M  graph/src/data_source/causality_region.rs
+M  graph/src/env/mappings.rs
+A  graph/src/ipfs/builtin.rs
+M  graph/src/ipfs/mod.rs
+M  graph/src/log/mod.rs
+M  graph/src/runtime/asc_ptr.rs
+M  graph/src/runtime/mod.rs
+M  node/Cargo.toml
+M  node/src/chain.rs
+M  node/src/config.rs
+M  node/src/launcher.rs
+M  node/src/main.rs
+M  runtime/derive/src/lib.rs
+M  runtime/wasm/src/asc_abi/v0_0_4.rs
+M  runtime/wasm/src/asc_abi/v0_0_5.rs
+M  runtime/wasm/src/host.rs
+M  runtime/wasm/src/host_exports.rs
+M  runtime/wasm/src/mapping.rs
+M  runtime/wasm/src/module/context.rs
+M  runtime/wasm/src/module/instance.rs
+M  server/json-rpc/Cargo.toml
+A  server/json-rpc/src/content.rs
+M  server/json-rpc/src/lib.rs
+M  server/json-rpc/src/server.rs
+M  store/postgres/Cargo.toml
+A  store/postgres/migrations/2026-09-28-000000_ipfs_content/down.sql
+A  store/postgres/migrations/2026-09-28-000000_ipfs_content/up.sql
+A  store/postgres/src/content_store.rs
+A  store/postgres/src/copy_insert.rs
+M  store/postgres/src/deployment_store.rs
+M  store/postgres/src/dynds/private.rs
+M  store/postgres/src/lib.rs
+M  store/postgres/src/notification_listener.rs
+M  store/postgres/src/relational.rs
+M  store/postgres/src/relational_queries.rs
+M  store/postgres/src/writable.rs
+A  turbo/bench/__pycache__/run.cpython-314.pyc
+A  turbo/bench/run.py
+A  turbo/bench/subgraphs/.gitignore
+A  turbo/bench/subgraphs/abis/ERC20.json
+A  turbo/bench/subgraphs/abis/ProxyFactory130.json
+A  turbo/bench/subgraphs/abis/ProxyFactory141.json
+A  turbo/bench/subgraphs/abis/Safe.json
+A  turbo/bench/subgraphs/allowances/schema.graphql
+A  turbo/bench/subgraphs/allowances/src/mapping.ts
+A  turbo/bench/subgraphs/allowances/subgraph.yaml
+A  turbo/bench/subgraphs/package.json
+A  turbo/bench/subgraphs/pnpm-lock.yaml
+A  turbo/bench/subgraphs/reth-balances/schema.graphql
+A  turbo/bench/subgraphs/reth-balances/src/mapping.ts
+A  turbo/bench/subgraphs/reth-balances/subgraph.yaml
+A  turbo/bench/subgraphs/safe/schema.graphql
+A  turbo/bench/subgraphs/safe/src/factory.ts
+A  turbo/bench/subgraphs/safe/src/safe.ts
+A  turbo/bench/subgraphs/safe/subgraph.yaml
+A  turbo/bench/subgraphs/usdc-transfers/schema.graphql
+A  turbo/bench/subgraphs/usdc-transfers/src/mapping.ts
+A  turbo/bench/subgraphs/usdc-transfers/subgraph.yaml
+A  turbo/plan.md
+A  turbo/reports/progress.md
+```
