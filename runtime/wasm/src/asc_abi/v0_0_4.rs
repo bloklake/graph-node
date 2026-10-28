@@ -28,11 +28,10 @@ pub struct ArrayBuffer {
 
 impl ArrayBuffer {
     pub fn new<T: AscType>(values: &[T]) -> Result<Self, DeterministicHostError> {
-        let mut content = Vec::new();
+        let mut content = Vec::with_capacity(size_of_val(values));
         for value in values {
-            let asc_bytes = value.to_asc_bytes()?;
             // An `AscValue` has size equal to alignment, no padding required.
-            content.extend(&asc_bytes);
+            value.append_asc_bytes(&mut content)?;
         }
 
         if content.len() > u32::MAX as usize {
@@ -59,11 +58,7 @@ impl ArrayBuffer {
         let length = length as usize;
         let byte_offset = byte_offset as usize;
 
-        self.content[byte_offset..]
-            .chunks(size_of::<T>())
-            .take(length)
-            .map(|asc_obj| T::from_asc_bytes(asc_obj, api_version))
-            .collect()
+        T::vec_from_asc_bytes(&self.content[byte_offset..], length, api_version)
 
         // TODO: This code is preferred as it validates the length of the array.
         // But, some existing subgraphs were found to break when this was added.
@@ -84,12 +79,12 @@ impl ArrayBuffer {
 
 impl AscType for ArrayBuffer {
     fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError> {
-        let mut asc_layout: Vec<u8> = Vec::new();
-
         let byte_length: [u8; 4] = self.byte_length.to_le_bytes();
+        let mut asc_layout: Vec<u8> =
+            Vec::with_capacity((self.byte_length as usize + 8).next_power_of_two());
         asc_layout.extend(byte_length);
         asc_layout.extend(self.padding);
-        asc_layout.extend(self.content.iter());
+        asc_layout.extend_from_slice(&self.content);
 
         // Allocate extra capacity to next power of two, as required by asc.
         let header_size = size_of_val(&byte_length) + size_of_val(&self.padding);

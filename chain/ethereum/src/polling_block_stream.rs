@@ -114,6 +114,8 @@ pub struct PollingBlockStream {
     consecutive_err_count: u32,
     chain_head_update_stream: ChainHeadUpdateStream,
     ctx: PollingBlockStreamContext,
+    /// Events buffered ahead of the consumer.
+    buffer_size: usize,
 }
 
 // This is the same as `ReconciliationStep` but without retries.
@@ -158,7 +160,19 @@ impl PollingBlockStream {
                 target_triggers_per_block_range,
                 unified_api_version,
             },
+            buffer_size: BUFFERED_BLOCK_STREAM_SIZE,
         }
+    }
+
+    /// For a source that answers large ranges in one request (a datalake): start with ranges
+    /// of `initial_range` blocks instead of growing from one block, and let `buffer_size`
+    /// events queue up ahead of the consumer.
+    pub fn with_large_ranges(mut self, initial_range: BlockNumber, buffer_size: usize) -> Self {
+        self.ctx.previous_block_range_size = initial_range.max(1) / 10;
+        // No density estimate yet: size the first range by `initial_range` alone.
+        self.ctx.previous_triggers_per_block = 0.0;
+        self.buffer_size = buffer_size;
+        self
     }
 }
 
@@ -222,6 +236,16 @@ impl PollingBlockStreamContext {
         // Make sure not to include genesis in the reorg threshold.
         let reorg_threshold = ctx.reorg_threshold.min(head_ptr.number);
 
+        // Blocks up to here are final: beyond the reorg threshold, or at or below the highest
+        // block a trusted source (a datalake) reports as final.
+        let final_limit = cmp::max(
+            head_ptr.number - reorg_threshold,
+            ctx.adapter
+                .final_block_number()
+                .await?
+                .map_or(BlockNumber::MIN, |n| n.min(head_ptr.number)),
+        );
+
         // Only continue if the subgraph block ptr is behind the head block ptr.
         // subgraph_ptr > head_ptr shouldn't happen, but if it does, it's safest to just stop.
         if let Some(ptr) = &subgraph_ptr
@@ -264,9 +288,7 @@ impl PollingBlockStreamContext {
         // Most importantly: Our ability to make this assumption (or not) will determine what
         // Ethereum RPC calls can give us accurate data without race conditions.
         // (This is mostly due to some unfortunate API design decisions on the Ethereum side)
-        if subgraph_ptr.is_none()
-            || (head_ptr.number - subgraph_ptr.as_ref().unwrap().number) > reorg_threshold
-        {
+        if subgraph_ptr.is_none() || subgraph_ptr.as_ref().unwrap().number < final_limit {
             // Since we are beyond the reorg threshold, the Ethereum node knows what block has
             // been permanently assigned this block number.
             // This allows us to ask the node: does subgraph_ptr point to a block that was
@@ -322,7 +344,7 @@ impl PollingBlockStreamContext {
             // End either just before the the next data source start_block or just
             // prior to the reorg threshold. It isn't safe to go farther than the
             // reorg threshold due to race conditions.
-            let to_limit = cmp::min(head_ptr.number - reorg_threshold, next_start_block - 1);
+            let to_limit = cmp::min(final_limit, next_start_block - 1);
 
             // Calculate the range size according to the target number of triggers,
             // respecting the global maximum and also not increasing too
@@ -366,7 +388,7 @@ impl PollingBlockStreamContext {
             // greater than or equal to `to`, we retry later. This deferment allows the chain head to advance,
             // ensuring the target block range becomes finalized. It effectively minimizes the risk of chain reorg
             // affecting the processing by waiting for a more stable set of blocks.
-            if to > head_ptr.number - reorg_threshold {
+            if to > final_limit {
                 return Ok(ReconciliationStep::Retry);
             }
 
@@ -474,7 +496,7 @@ impl PollingBlockStreamContext {
 
 impl BlockStream<Chain> for PollingBlockStream {
     fn buffer_size_hint(&self) -> usize {
-        BUFFERED_BLOCK_STREAM_SIZE
+        self.buffer_size
     }
 }
 

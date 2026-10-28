@@ -100,21 +100,24 @@ impl<C: AscType> AscPtr<C> {
             _ => {
                 let mut bytes = asc_obj.to_asc_bytes()?;
 
-                let aligned_len = padding_to_16(bytes.len());
                 // Since AssemblyScript keeps all allocated objects with a 16 byte alignment,
                 // we need to do the same when we allocate ourselves.
-                bytes.extend(std::iter::repeat_n(0, aligned_len));
+                let full_len = bytes.len() + padding_to_16(bytes.len());
+                bytes.resize(full_len, 0);
 
                 let header = Self::generate_header(
                     heap,
                     C::INDEX_ASC_TYPE_ID,
                     asc_obj.content_len(&bytes),
-                    bytes.len(),
+                    full_len,
                 )
                 .await?;
                 let header_len = header.len() as u32;
 
-                let heap_ptr = heap.raw_new(&[header, bytes].concat(), gas).await?;
+                let mut obj = Vec::with_capacity(header.len() + full_len);
+                obj.extend_from_slice(&header);
+                obj.extend_from_slice(&bytes);
+                let heap_ptr = heap.raw_new(&obj, gas).await?;
 
                 // Use header length as offset. so the AscPtr points directly at the content.
                 Ok(AscPtr::new(heap_ptr + header_len))
@@ -239,6 +242,10 @@ impl<C> From<u32> for AscPtr<C> {
 impl<T> AscType for AscPtr<T> {
     fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError> {
         self.0.to_asc_bytes()
+    }
+
+    fn append_asc_bytes(&self, out: &mut Vec<u8>) -> Result<(), DeterministicHostError> {
+        self.0.append_asc_bytes(out)
     }
 
     fn from_asc_bytes(

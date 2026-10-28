@@ -10,7 +10,7 @@ use crate::components::store::write::EntityModification;
 use crate::components::store::{self as s, Entity, EntityOperation};
 use crate::data::store::{EntityValidationError, Id, IdType, IntoEntityIterator};
 use crate::prelude::{CacheWeight, ENV_VARS, StopwatchMetrics};
-use crate::schema::{EntityKey, InputSchema};
+use crate::schema::{EntityKey, EntityType, InputSchema};
 use crate::util::intern::Error as InternError;
 use crate::util::lfu_cache::{EvictStats, LfuCache};
 
@@ -152,6 +152,11 @@ pub struct EntityCache {
 
     /// Shared sequence generator for VIDs and entity IDs within a block.
     pub seq_gen: SeqGenerator,
+
+    /// True when `current` holds every entity the store has for this deployment, so a key
+    /// missing from `current` does not exist and needs no store lookup. Only a deployment that
+    /// starts from an empty store can know this; the first eviction ends it.
+    complete: bool,
 }
 
 impl Debug for EntityCache {
@@ -167,6 +172,9 @@ pub struct ModificationsAndCache {
     pub modifications: Vec<s::EntityModification>,
     pub entity_lfu_cache: EntityLfuCache,
     pub evict_stats: EvictStats,
+    /// Whether `entity_lfu_cache` still holds every entity of the deployment (see
+    /// [`EntityCache::mark_complete`]).
+    pub complete: bool,
 }
 
 impl EntityCache {
@@ -179,6 +187,7 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq_gen,
+            complete: false,
         }
     }
 
@@ -203,7 +212,28 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq_gen,
+            complete: false,
         }
+    }
+
+    /// Whether this block's handlers (including the running one) wrote `key`.
+    pub fn touched(&self, key: &EntityKey) -> bool {
+        self.updates.contains_key(key) || self.handler_updates.contains_key(key)
+    }
+
+    /// Whether this block's handlers wrote any entity of `entity_type`.
+    pub fn touched_type(&self, entity_type: &EntityType) -> bool {
+        self.updates
+            .keys()
+            .chain(self.handler_updates.keys())
+            .any(|key| &key.entity_type == entity_type)
+    }
+
+    /// Declares that the cache holds every entity the store has for this deployment (the
+    /// caller knows the store started empty and nothing was evicted since). Lookups of keys
+    /// not in the cache then return `None` without asking the store.
+    pub fn mark_complete(&mut self, complete: bool) {
+        self.complete = complete;
     }
 
     pub fn seq_gen(&self) -> SeqGenerator {
@@ -242,7 +272,13 @@ impl EntityCache {
         let mut entity: Option<Arc<Entity>> = match scope {
             GetScope::Store => {
                 if !self.current.contains_key(key) {
-                    let entity = self.store.get(key).await?;
+                    // Immutable entities are not kept in `current` after they are written
+                    // (see `as_modifications`), so `complete` does not speak for them.
+                    let entity = if self.complete && !key.entity_type.is_immutable() {
+                        None
+                    } else {
+                        self.store.get(key).await?
+                    };
                     self.current.insert(key.clone(), entity.map(Arc::new));
                 }
                 // Unwrap: we just inserted the entity
@@ -356,7 +392,19 @@ impl EntityCache {
     ) -> Result<(), anyhow::Error> {
         // check the validate for derived fields
         let is_valid = entity.validate(&key).is_ok();
+        self.set_validated(key, entity, is_valid, write_capacity_remaining)
+            .await
+    }
 
+    /// `set` for an entity whose validity on its own (`entity.validate(&key).is_ok()`) is
+    /// already known; replaying a speculative handler run knows it.
+    pub async fn set_validated(
+        &mut self,
+        key: EntityKey,
+        entity: Entity,
+        is_valid: bool,
+        write_capacity_remaining: Option<&mut usize>,
+    ) -> Result<(), anyhow::Error> {
         if let Some(write_capacity_remaining) = write_capacity_remaining {
             let weight = entity.weight();
             if !self.current.contains_key(&key) && weight > *write_capacity_remaining {
@@ -469,10 +517,15 @@ impl EntityCache {
         {
             let _section = stopwatch.start_section("as_modifications_load");
 
-            let missing = missing.filter(|key| !key.entity_type.is_immutable());
+            let missing: std::collections::BTreeSet<_> = missing
+                .filter(|key| !self.complete && !key.entity_type.is_immutable())
+                .cloned()
+                .collect();
 
-            for (entity_key, entity) in self.store.get_many(missing.cloned().collect()).await? {
-                self.current.insert(entity_key, Some(Arc::new(entity)));
+            if !missing.is_empty() {
+                for (entity_key, entity) in self.store.get_many(missing).await? {
+                    self.current.insert(entity_key, Some(Arc::new(entity)));
+                }
             }
         }
 
@@ -487,7 +540,11 @@ impl EntityCache {
                 | (None, EntityOp::Overwrite(mut updates)) => {
                     updates.remove_null_fields();
                     let data = Arc::new(updates);
-                    self.current.insert(key.clone(), Some(data.cheap_clone()));
+                    // Immutable entities are inserted once and rarely read back; keeping them
+                    // would only cost cache upkeep and evict entities that are read.
+                    if !key.entity_type.is_immutable() {
+                        self.current.insert(key.clone(), Some(data.cheap_clone()));
+                    }
                     Some(Insert {
                         key,
                         data,
@@ -545,11 +602,13 @@ impl EntityCache {
         let evict_stats = self
             .current
             .evict_and_stats(ENV_VARS.mappings.entity_cache_size);
+        let complete = self.complete && evict_stats.evicted_count == 0;
 
         Ok(ModificationsAndCache {
             modifications: mods,
             entity_lfu_cache: self.current,
             evict_stats,
+            complete,
         })
     }
 }

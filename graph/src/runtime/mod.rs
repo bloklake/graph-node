@@ -48,6 +48,27 @@ pub trait AscType: Sized {
     /// bytes that is precisely the memory layout of a corresponding Asc instance.
     fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError>;
 
+    /// Append the bytes `to_asc_bytes` returns to `out`. Primitives override this so that
+    /// serializing an object or a buffer does not allocate a vector per field or element.
+    fn append_asc_bytes(&self, out: &mut Vec<u8>) -> Result<(), DeterministicHostError> {
+        out.extend_from_slice(&self.to_asc_bytes()?);
+        Ok(())
+    }
+
+    /// Decode `length` consecutive values from `asc_bytes`, `size_of::<Self>()` bytes each.
+    /// Stops early if `asc_bytes` runs out.
+    fn vec_from_asc_bytes(
+        asc_bytes: &[u8],
+        length: usize,
+        api_version: &Version,
+    ) -> Result<Vec<Self>, DeterministicHostError> {
+        asc_bytes
+            .chunks(size_of::<Self>())
+            .take(length)
+            .map(|asc_obj| Self::from_asc_bytes(asc_obj, api_version))
+            .collect()
+    }
+
     /// The Rust representation of an Asc object as layed out in Asc memory.
     fn from_asc_bytes(
         asc_obj: &[u8],
@@ -96,6 +117,11 @@ impl AscType for bool {
         Ok(vec![*self as u8])
     }
 
+    fn append_asc_bytes(&self, out: &mut Vec<u8>) -> Result<(), DeterministicHostError> {
+        out.push(*self as u8);
+        Ok(())
+    }
+
     fn from_asc_bytes(
         asc_obj: &[u8],
         _api_version: &Version,
@@ -120,6 +146,30 @@ macro_rules! impl_asc_type {
             impl AscType for $T {
                 fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError> {
                     Ok(self.to_le_bytes().to_vec())
+                }
+
+                fn append_asc_bytes(&self, out: &mut Vec<u8>) -> Result<(), DeterministicHostError> {
+                    out.extend_from_slice(&self.to_le_bytes());
+                    Ok(())
+                }
+
+                fn vec_from_asc_bytes(
+                    asc_bytes: &[u8],
+                    length: usize,
+                    _api_version: &Version,
+                ) -> Result<Vec<Self>, DeterministicHostError> {
+                    // A trailing partial chunk fails like `from_asc_bytes` on it would.
+                    let whole = (asc_bytes.len() / size_of::<Self>()).min(length);
+                    let mut out: Vec<Self> = asc_bytes
+                        .chunks_exact(size_of::<Self>())
+                        .take(whole)
+                        .map(|c| Self::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    if whole < length && asc_bytes.len() % size_of::<Self>() != 0 {
+                        let rest = &asc_bytes[whole * size_of::<Self>()..];
+                        out.push(Self::from_asc_bytes(rest, _api_version)?);
+                    }
+                    Ok(out)
                 }
 
                 fn from_asc_bytes(asc_obj: &[u8], _api_version: &Version) -> Result<Self, DeterministicHostError> {

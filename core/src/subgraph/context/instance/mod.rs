@@ -38,6 +38,15 @@ pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
     /// Maps the hash of a module to a channel to the thread in which the module is instantiated.
     module_cache: HashMap<[u8; 32], Sender<T::Req>>,
 
+    /// The hash of each module buffer seen, by address; data sources created from a template
+    /// share its buffer, so it is hashed once rather than once per data source. Holding the
+    /// buffer keeps its address from being reused for other bytes.
+    module_hashes: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])>,
+
+    /// Changes whenever hosts are added or removed, so callers can tell that matching a
+    /// trigger against the hosts would give the same result as before.
+    hosts_generation: u64,
+
     /// This manages the sequence of causality regions for the subgraph.
     causality_region_seq: CausalityRegionSeq,
 }
@@ -86,6 +95,8 @@ where
             subgraph_hosts: OnchainHosts::new(),
             offchain_hosts: OffchainHosts::new(),
             module_cache: HashMap::new(),
+            module_hashes: HashMap::new(),
+            hosts_generation: 0,
             templates,
             host_metrics,
             causality_region_seq,
@@ -104,7 +115,20 @@ where
         };
 
         let mapping_request_sender = {
-            let module_hash = alloy::primitives::keccak256(module_bytes.as_ref()).0;
+            let module_hash = match self
+                .module_hashes
+                .get(&(Arc::as_ptr(&module_bytes) as usize))
+            {
+                Some((_, hash)) => *hash,
+                None => {
+                    let hash = alloy::primitives::keccak256(module_bytes.as_ref()).0;
+                    self.module_hashes.insert(
+                        Arc::as_ptr(&module_bytes) as usize,
+                        (module_bytes.cheap_clone(), hash),
+                    );
+                    hash
+                }
+            };
             if let Some(sender) = self.module_cache.get(&module_hash) {
                 sender.clone()
             } else {
@@ -146,6 +170,7 @@ where
         let Some(host) = self.new_host(logger.clone(), data_source)? else {
             return Ok(None);
         };
+        self.hosts_generation += 1;
 
         // Check for duplicates and add the host.
         match host.data_source() {
@@ -194,6 +219,7 @@ where
         &mut self,
         reverted_block: BlockNumber,
     ) -> Vec<offchain::Source> {
+        self.hosts_generation += 1;
         self.revert_onchain_hosts(reverted_block);
         self.offchain_hosts.remove_ge_block(reverted_block);
 
@@ -250,6 +276,16 @@ where
 
     pub(super) fn causality_region_next_value(&mut self) -> CausalityRegion {
         self.causality_region_seq.next_val()
+    }
+
+    /// The onchain hosts `hosts_for_trigger` returns for an onchain trigger, as shared handles.
+    pub fn onchain_hosts_for_trigger(&self, trigger: &C::TriggerData) -> Vec<Arc<T::Host>> {
+        self.onchain_hosts
+            .matches_by_address_arc(trigger.address_match())
+    }
+
+    pub fn hosts_generation(&self) -> u64 {
+        self.hosts_generation
     }
 
     pub fn hosts_len(&self) -> usize {

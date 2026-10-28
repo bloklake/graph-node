@@ -161,7 +161,14 @@ impl From<ConfigChainSettings> for ChainSettings {
             get_logs_max_contracts,
             block_ingestor_max_concurrent_json_rpc_calls,
             genesis_block_number,
+            datalake,
         } = c;
+        let datalake = datalake.map(|settings| {
+            Arc::new(
+                graph_chain_ethereum::datalake::DatalakeClient::new(settings)
+                    .expect("datalake client can be created"),
+            )
+        });
         ChainSettings {
             polling_interval,
             json_rpc_timeout,
@@ -174,6 +181,7 @@ impl From<ConfigChainSettings> for ChainSettings {
             get_logs_max_contracts,
             block_ingestor_max_concurrent_json_rpc_calls,
             genesis_block_number,
+            datalake,
         }
     }
 }
@@ -398,6 +406,7 @@ pub async fn networks_as_chains(
                     metrics_registry.clone(),
                     chain_store.clone(),
                     eth_adapters.clone(),
+                    settings.datalake.clone(),
                 );
 
                 let call_cache = chain_store.cheap_clone();

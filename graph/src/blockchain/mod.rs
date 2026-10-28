@@ -160,7 +160,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     type UnresolvedDataSourceTemplate: UnresolvedDataSourceTemplate<Self> + Clone;
 
     /// Trigger data as parsed from the triggers adapter.
-    type TriggerData: TriggerData + Ord + Send + Sync + Debug;
+    type TriggerData: TriggerData + Ord + Send + Sync + Debug + Clone;
 
     /// Decoded trigger ready to be processed by the mapping.
     /// New implementations should have this be the same as `TriggerData`.
@@ -209,6 +209,12 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     ) -> Result<Self::Block, Error>;
 
     fn is_refetch_block_required(&self) -> bool;
+
+    /// True when triggers for template data sources are cheaper to fetch by event alone
+    /// (static filters) than by restarting the block stream for every new data source.
+    fn prefers_static_filters(&self) -> bool {
+        false
+    }
 
     async fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)>;
 

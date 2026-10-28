@@ -7,13 +7,17 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::post;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post};
 use graph::prelude::{NodeId, SubgraphRegistrar};
 use slog::{Logger, info};
 use thiserror::Error;
 use tokio::sync::Notify;
 
 use crate::handlers::{AppState, jsonrpc_handler};
+
+/// Largest upload `/api/v0/add` accepts (a subgraph's WASM is usually well under this).
+const CONTENT_BODY_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Errors that can occur when starting the JSON-RPC server.
 #[derive(Debug, Error)]
@@ -63,9 +67,17 @@ impl JsonRpcServer {
             logger,
         });
 
+        let content = Router::new()
+            .route("/api/v0/add", post(crate::content::add))
+            .route("/api/v0/cat", post(crate::content::cat))
+            .route("/api/v0/pin/add", post(crate::content::pin_add))
+            .route("/api/v0/version", post(crate::content::version))
+            .route("/ipfs/{cid}", get(crate::content::get_file))
+            .layer(DefaultBodyLimit::max(CONTENT_BODY_LIMIT));
         let app = Router::new()
             .route("/", post(jsonrpc_handler::<R>))
-            .with_state(state);
+            .with_state(state)
+            .merge(content);
 
         let addr: SocketAddr = (Ipv4Addr::new(0, 0, 0, 0), port).into();
         let listener = tokio::net::TcpListener::bind(addr).await?;

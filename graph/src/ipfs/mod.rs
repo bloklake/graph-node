@@ -11,6 +11,7 @@ use slog::info;
 use crate::components::metrics::MetricsRegistry;
 use crate::util::security::SafeDisplay;
 
+pub mod builtin;
 mod cache;
 mod client;
 mod content_path;
@@ -44,6 +45,9 @@ pub type IpfsResult<T> = Result<T, IpfsError>;
 /// automatically selected and the response is streamed from that client.
 ///
 /// All clients are set up to cache results
+///
+/// No addresses, or the single address `builtin`, select the built-in content store (see
+/// [`builtin`]) instead of an IPFS server.
 pub async fn new_ipfs_client<I, S>(
     server_addresses: I,
     registry: &MetricsRegistry,
@@ -54,6 +58,14 @@ where
     S: AsRef<str>,
 {
     let metrics = IpfsMetrics::new(registry);
+    let server_addresses: Vec<S> = server_addresses.into_iter().collect();
+    if builtin::is_builtin(&server_addresses) {
+        info!(
+            logger,
+            "Using the built-in content store instead of an IPFS server"
+        );
+        return Ok(Arc::new(builtin::BuiltinIpfsClient::new(metrics)));
+    }
     let mut clients: Vec<Arc<dyn IpfsClient>> = Vec::new();
 
     for server_address in server_addresses {

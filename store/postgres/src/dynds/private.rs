@@ -154,48 +154,63 @@ impl DataSourcesTable {
         conn: &mut AsyncPgConnection,
         data_sources: &write::DataSources,
     ) -> Result<usize, StoreError> {
-        let mut inserted_total = 0;
+        // One statement per chunk of rows (arrays unnested server-side, in order, so vids follow
+        // creation order as before) instead of one per data source: factories create tens of
+        // thousands of data sources in a batch.
+        const CHUNK: usize = 10_000;
 
+        let mut rows = Vec::new();
         for (block_ptr, dss) in &data_sources.entries {
             let block = block_ptr.number;
             for ds in dss {
-                let StoredDynamicDataSource {
-                    manifest_idx,
-                    param,
-                    context,
-                    creation_block,
-                    done_at,
-                    causality_region,
-                } = ds;
-
                 // Nested offchain data sources might not pass this check, as their `creation_block`
                 // will be their parent's `creation_block`, not necessarily `block`.
-                if causality_region == &CausalityRegion::ONCHAIN && creation_block != &Some(block) {
+                if ds.causality_region == CausalityRegion::ONCHAIN
+                    && ds.creation_block != Some(block)
+                {
                     return Err(internal_error!(
                         "mismatching creation blocks `{:?}` and `{}`",
-                        creation_block,
+                        ds.creation_block,
                         block
                     ));
                 }
-
-                // Offchain data sources have a unique causality region assigned from a sequence in the
-                // database, while onchain data sources always have causality region 0.
-                let query = format!(
-                    "insert into {}(block_range, manifest_idx, param, context, causality_region, done_at) \
-                            values (int4range($1, null), $2, $3, $4, $5, $6)",
-                    self.qname
-                );
-
-                let query = sql_query(query)
-                    .bind::<Nullable<Integer>, _>(creation_block)
-                    .bind::<Integer, _>(*manifest_idx as i32)
-                    .bind::<Nullable<Binary>, _>(param.as_ref().map(|p| &**p))
-                    .bind::<Nullable<Jsonb>, _>(context)
-                    .bind::<Integer, _>(causality_region)
-                    .bind::<Nullable<Integer>, _>(done_at);
-
-                inserted_total += query.execute(conn).await?;
+                rows.push(ds);
             }
+        }
+
+        // Offchain data sources have a unique causality region assigned from a sequence in the
+        // database, while onchain data sources always have causality region 0.
+        let query = format!(
+            "insert into {}(block_range, manifest_idx, param, context, causality_region, done_at) \
+             select int4range(b, null), m, p, c, r, d \
+               from unnest($1::int4[], $2::int4[], $3::bytea[], $4::jsonb[], $5::int4[], $6::int4[]) \
+                 with ordinality as x(b, m, p, c, r, d, o) \
+              order by o",
+            self.qname
+        );
+        let mut inserted_total = 0;
+        for chunk in rows.chunks(CHUNK) {
+            let creation_blocks: Vec<Option<i32>> =
+                chunk.iter().map(|ds| ds.creation_block).collect();
+            let manifest_idxs: Vec<i32> = chunk.iter().map(|ds| ds.manifest_idx as i32).collect();
+            let params: Vec<Option<&[u8]>> = chunk
+                .iter()
+                .map(|ds| ds.param.as_ref().map(|p| &**p))
+                .collect();
+            let contexts: Vec<Option<&serde_json::Value>> =
+                chunk.iter().map(|ds| ds.context.as_ref()).collect();
+            let causality_regions: Vec<CausalityRegion> =
+                chunk.iter().map(|ds| ds.causality_region).collect();
+            let done_ats: Vec<Option<i32>> = chunk.iter().map(|ds| ds.done_at).collect();
+            inserted_total += sql_query(&query)
+                .bind::<sql_types::Array<Nullable<Integer>>, _>(creation_blocks)
+                .bind::<sql_types::Array<Integer>, _>(manifest_idxs)
+                .bind::<sql_types::Array<Nullable<Binary>>, _>(params)
+                .bind::<sql_types::Array<Nullable<Jsonb>>, _>(contexts)
+                .bind::<sql_types::Array<Integer>, _>(causality_regions)
+                .bind::<sql_types::Array<Nullable<Integer>>, _>(done_ats)
+                .execute(conn)
+                .await?;
         }
         Ok(inserted_total)
     }

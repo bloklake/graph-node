@@ -94,6 +94,68 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
 
     /// Return a metrics object for this host.
     fn host_metrics(&self) -> Arc<HostMetrics>;
+
+    /// Whether `run_speculative` can run this host's handlers ahead of time.
+    fn can_speculate(&self) -> bool {
+        false
+    }
+
+    /// Runs `trigger` ahead of time (on a speculation worker; see `can_speculate`): matches and
+    /// decodes it for this host and, when it matches and `worth_running` agrees for the
+    /// handler, runs the handler against `state` (a fresh state whose `speculation` log
+    /// records what the handler reads and writes).
+    async fn run_speculative(
+        self: Arc<Self>,
+        _logger: Logger,
+        _trigger: TriggerData<C>,
+        _block: Arc<C::Block>,
+        _state: BlockState,
+        _worth_running: Arc<dyn Fn(String) -> bool + Send + Sync>,
+    ) -> Result<SpeculativeRun, MappingError> {
+        Err(MappingError::Unknown(anyhow::anyhow!(
+            "this host cannot run handlers speculatively"
+        )))
+    }
+
+    /// The causality region this host's handlers write proof of indexing events to.
+    fn poi_causality_region(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// What a speculative run left behind (the rest of its block state is dropped where it ran).
+pub struct SpeculativeResult {
+    pub log: crate::components::subgraph::SpeculationLog,
+    pub created_data_sources: Vec<crate::components::subgraph::InstanceDSTemplateInfo>,
+    pub metrics: crate::components::metrics::block_state::BlockStateMetrics,
+    /// Whether the handler failed with a deterministic error.
+    pub failed: bool,
+}
+
+impl SpeculativeResult {
+    /// Takes the parts of a speculative run's `state` the runner needs.
+    pub fn from_state(mut state: BlockState) -> Option<Self> {
+        let log = state.speculation.take()?;
+        Some(SpeculativeResult {
+            log,
+            created_data_sources: state.drain_created_data_sources(),
+            metrics: std::mem::take(&mut state.metrics),
+            failed: !state.deterministic_errors.is_empty(),
+        })
+    }
+}
+
+/// The outcome of `RuntimeHost::run_speculative`.
+pub enum SpeculativeRun {
+    /// The handler ran; `result` is what the runner needs to judge and replay the run.
+    Ran {
+        result: SpeculativeResult,
+        handler: String,
+    },
+    /// The trigger does not match the host.
+    NotMatched,
+    /// The host matched but its handler was not run (not worth it).
+    Skipped { handler: String },
 }
 
 pub struct HostMetrics {
@@ -105,6 +167,17 @@ pub struct HostMetrics {
 }
 
 impl HostMetrics {
+    /// The same metrics without the stopwatch, for handlers run on speculation threads.
+    pub fn speculative(&self) -> Self {
+        HostMetrics {
+            handler_execution_time: self.handler_execution_time.clone(),
+            host_fn_execution_time: self.host_fn_execution_time.clone(),
+            eth_call_execution_time: self.eth_call_execution_time.clone(),
+            gas_metrics: self.gas_metrics.clone(),
+            stopwatch: self.stopwatch.disabled_copy(),
+        }
+    }
+
     pub fn new(
         registry: Arc<MetricsRegistry>,
         subgraph: &str,

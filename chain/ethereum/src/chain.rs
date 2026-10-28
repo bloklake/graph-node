@@ -84,6 +84,8 @@ pub struct ChainSettings {
     pub get_logs_max_contracts: usize,
     pub block_ingestor_max_concurrent_json_rpc_calls: usize,
     pub genesis_block_number: u64,
+    /// Serves historical log triggers when set (`[chains.<name>.datalake]`).
+    pub datalake: Option<Arc<crate::datalake::DatalakeClient>>,
 }
 
 impl ChainSettings {
@@ -103,6 +105,7 @@ impl ChainSettings {
             block_ingestor_max_concurrent_json_rpc_calls: ENV_VARS
                 .block_ingestor_max_concurrent_json_rpc_calls,
             genesis_block_number: ENV_VARS.genesis_block_number,
+            datalake: None,
         }
     }
 }
@@ -235,8 +238,20 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
         } else {
             chain.settings.max_block_range_size
         };
+        // A datalake answers large ranges in one request: scan in much larger steps.
+        let (max_block_range_size, target_triggers_per_block_range) = match &chain.settings.datalake
+        {
+            Some(datalake) => (
+                max_block_range_size.max(datalake.settings().max_block_range),
+                datalake.settings().target_triggers,
+            ),
+            None => (
+                max_block_range_size,
+                chain.settings.target_triggers_per_block_range,
+            ),
+        };
 
-        Ok(Box::new(PollingBlockStream::new(
+        let stream = PollingBlockStream::new(
             chain_head_update_stream,
             Arc::new(adapter),
             deployment.hash,
@@ -245,10 +260,19 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
             reorg_threshold,
             logger,
             max_block_range_size,
-            chain.settings.target_triggers_per_block_range,
+            target_triggers_per_block_range,
             unified_api_version,
             subgraph_current_block,
-        )))
+        );
+        let stream = match &chain.settings.datalake {
+            // First range: a fiftieth of the largest (the first answer arrives quickly; ranges
+            // grow tenfold per step).
+            Some(datalake) => {
+                stream.with_large_ranges(datalake.settings().max_block_range / 50, 2_000)
+            }
+            None => stream,
+        };
+        Ok(Box::new(stream))
     }
 }
 
@@ -279,6 +303,7 @@ pub struct EthereumAdapterSelector {
     registry: Arc<MetricsRegistry>,
     chain_store: Arc<dyn ChainStore>,
     eth_adapters: Arc<EthereumNetworkAdapters>,
+    datalake: Option<Arc<crate::datalake::DatalakeClient>>,
 }
 
 impl EthereumAdapterSelector {
@@ -288,6 +313,7 @@ impl EthereumAdapterSelector {
         registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
         eth_adapters: Arc<EthereumNetworkAdapters>,
+        datalake: Option<Arc<crate::datalake::DatalakeClient>>,
     ) -> Self {
         Self {
             logger_factory,
@@ -295,6 +321,7 @@ impl EthereumAdapterSelector {
             registry,
             chain_store,
             eth_adapters,
+            datalake,
         }
     }
 }
@@ -321,6 +348,7 @@ impl TriggersAdapterSelector<Chain> for EthereumAdapterSelector {
             unified_api_version,
             capabilities: *capabilities,
             eth_adapters: self.eth_adapters.cheap_clone(),
+            datalake: self.datalake.clone(),
         };
         Ok(Arc::new(adapter))
     }
@@ -612,6 +640,11 @@ impl Blockchain for Chain {
         self.block_refetcher.required(self)
     }
 
+    fn prefers_static_filters(&self) -> bool {
+        // A datalake answers event-only filters as cheaply as address filters.
+        self.settings.datalake.is_some()
+    }
+
     async fn refetch_firehose_block(
         &self,
         logger: &Logger,
@@ -805,6 +838,7 @@ pub struct TriggersAdapter {
     capabilities: NodeCapabilities,
     unified_api_version: UnifiedMappingApiVersion,
     eth_adapters: Arc<EthereumNetworkAdapters>,
+    datalake: Option<Arc<crate::datalake::DatalakeClient>>,
 }
 
 /// Fetches blocks from the cache based on block numbers, excluding duplicates
@@ -912,6 +946,14 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         to: BlockNumber,
         filter: &TriggerFilter,
     ) -> Result<(Vec<BlockWithTriggers<Chain>>, BlockNumber), Error> {
+        if let Some(datalake) = &self.datalake {
+            match datalake.scan(&self.logger, from, to, filter).await {
+                Ok(Some(scanned)) => return self.datalake_triggers(scanned, filter).await,
+                Ok(None) => {}
+                Err(e) => warn!(self.logger, "Datalake scan failed, using JSON-RPC for this range";
+                    "from" => from, "to" => to, "error" => format!("{e:#}")),
+            }
+        }
         blocks_with_triggers(
             self.chain_client
                 .rpc()?
@@ -1019,7 +1061,29 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
 
     async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
         let chain_store = self.chain_store.clone();
-        chain_store.chain_head_ptr().await
+        let head = chain_store.chain_head_ptr().await?;
+        if head.is_some() {
+            return Ok(head);
+        }
+        // Until the block ingestor has stored the chain head, the datalake's height serves as
+        // the head for scanning history: scans stay `reorg_threshold` blocks below it, and near
+        // it the stream needs the ingested ancestors, so it waits for the ingestor there.
+        if let Some(datalake) = &self.datalake
+            && let Ok(Some(height)) = datalake.archive_height().await
+        {
+            return Ok(datalake
+                .block_ptr(&self.logger, height)
+                .await
+                .unwrap_or(None));
+        }
+        Ok(None)
+    }
+
+    async fn final_block_number(&self) -> Result<Option<BlockNumber>, Error> {
+        match &self.datalake {
+            Some(datalake) => Ok(datalake.finalized_height().await.unwrap_or(None)),
+            None => Ok(None),
+        }
     }
 
     async fn triggers_in_block(
@@ -1037,6 +1101,23 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
             block,
         )
         .await?;
+
+        // A block the datalake scanned has the logs a new data source in it matches already,
+        // when the scan's filter included that data source's events (static filters).
+        if let (Some(datalake), BlockFinality::Final(light)) = (&self.datalake, &block)
+            && filter.call.is_empty()
+            && filter.block.is_empty()
+            && let Some(logs) = datalake.recent_logs(light.number(), &filter.log)
+            && crate::datalake::receipts_needed(filter, &logs.iter().collect::<Vec<_>>()).is_empty()
+        {
+            let triggers = logs
+                .into_iter()
+                .map(|log| {
+                    crate::trigger::EthereumTrigger::Log(crate::trigger::LogRef::FullLog(log, None))
+                })
+                .collect();
+            return Ok(BlockWithTriggers::new(block, triggers, logger));
+        }
 
         match &block {
             BlockFinality::Final(_) => {
@@ -1227,6 +1308,59 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
 }
 
 impl TriggersAdapter {
+    /// Turns a datalake scan into blocks with log triggers, fetching receipts over JSON-RPC for
+    /// the handlers that ask for them.
+    async fn datalake_triggers(
+        &self,
+        scanned: crate::datalake::Scanned,
+        filter: &TriggerFilter,
+    ) -> Result<(Vec<BlockWithTriggers<Chain>>, BlockNumber), Error> {
+        let needed = if self
+            .unified_api_version
+            .equal_or_greater_than(&graph::data::subgraph::API_VERSION_0_0_7)
+        {
+            let logs: Vec<_> = scanned.blocks.iter().flat_map(|(_, logs)| logs).collect();
+            crate::datalake::receipts_needed(filter, &logs)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let receipts = if needed.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let adapter = self
+                .chain_client
+                .rpc()?
+                .cheapest_with(&self.capabilities)
+                .await?;
+            crate::ethereum_adapter::receipts_for_transactions(
+                &adapter,
+                &self.logger,
+                self.ethrpc_metrics.clone(),
+                &needed,
+            )
+            .await?
+        };
+        let blocks = scanned
+            .blocks
+            .into_iter()
+            .map(|(block, logs)| {
+                let triggers = logs
+                    .into_iter()
+                    .map(|log| {
+                        let receipt = log
+                            .transaction_hash
+                            .and_then(|tx| receipts.get(&tx).cloned());
+                        crate::trigger::EthereumTrigger::Log(crate::trigger::LogRef::FullLog(
+                            log, receipt,
+                        ))
+                    })
+                    .collect();
+                BlockWithTriggers::new(BlockFinality::Final(block), triggers, &self.logger)
+            })
+            .collect();
+        Ok((blocks, scanned.to))
+    }
+
     async fn fetch_block_with_firehose(
         &self,
         endpoints: &FirehoseEndpoints,

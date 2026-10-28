@@ -59,6 +59,10 @@ impl CausalityRegion {
         CausalityRegion(self.0 + 1)
     }
 
+    pub const fn as_i32(self) -> i32 {
+        self.0
+    }
+
     pub fn from_entity(entity: &Entity) -> Self {
         entity
             .get("causality_region")

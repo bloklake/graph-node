@@ -7,6 +7,7 @@ use crate::{
     data::subgraph::schema::SubgraphError,
     data_source::{DataSourceTemplate, DataSourceTemplateInfo},
     prelude::*,
+    schema::{EntityKey, EntityType},
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,47 @@ pub struct InstanceDSTemplateInfo {
     pub creation_block: BlockNumber,
 }
 
+/// A store write a speculatively executed handler made, in the order it made them.
+#[derive(Debug)]
+pub enum SpeculativeOp {
+    /// `store.set`: the key, the entity as the handler passed it (no vid yet), the id as the
+    /// proof of indexing records it, and whether the entity was valid on its own.
+    Set {
+        key: EntityKey,
+        entity: Entity,
+        poi_id: String,
+        valid: bool,
+    },
+    /// `store.remove`: the key, and the type and id strings the proof of indexing records.
+    Remove {
+        key: EntityKey,
+        poi_type: String,
+        poi_id: String,
+    },
+}
+
+/// What a handler run ahead of time on a speculation thread read and wrote. The runner replays
+/// `ops` when none of what the handler read has changed since the speculation's snapshot, and
+/// runs the handler normally otherwise.
+#[derive(Debug, Default)]
+pub struct SpeculationLog {
+    pub ops: Vec<SpeculativeOp>,
+    /// Keys the handler read (from the store or from the block's own writes), and keys whose
+    /// write needed the stored entity to validate.
+    pub reads: Vec<EntityKey>,
+    /// Entity types a derived-field lookup (`loadRelated`) scanned.
+    pub related_types: Vec<EntityType>,
+    /// The handler did something that cannot be replayed (generated an id, `ipfs.map`).
+    pub unsupported: bool,
+    /// The handler asked the chain for something (`ethereum.call`, say). The answers are cached,
+    /// so running the handler again finds them even when the run itself cannot be replayed.
+    pub chain_calls: bool,
+    /// The proof of indexing contributions of `ops`, in order, computed for the positions from
+    /// `poi_start` on; empty if not computed.
+    pub poi: Vec<crate::components::subgraph::PoiContribution>,
+    pub poi_start: u64,
+}
+
 #[derive(Debug)]
 pub struct BlockState {
     pub entity_cache: EntityCache,
@@ -84,6 +126,9 @@ pub struct BlockState {
     pub metrics: BlockStateMetrics,
 
     pub write_capacity_remaining: usize,
+
+    /// Set on the state of a speculatively executed handler: records what it read and wrote.
+    pub speculation: Option<SpeculationLog>,
 }
 
 impl BlockState {
@@ -98,6 +143,7 @@ impl BlockState {
             in_handler: false,
             metrics: BlockStateMetrics::new(),
             write_capacity_remaining: ENV_VARS.block_write_capacity,
+            speculation: None,
         }
     }
 
@@ -120,6 +166,7 @@ impl BlockState {
             in_handler,
             metrics,
             write_capacity_remaining,
+            speculation: _,
         } = self;
 
         match in_handler {

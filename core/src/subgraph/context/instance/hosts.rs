@@ -96,6 +96,26 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> OnchainHosts<C, T> {
     /// Returns an iterator over all hosts that match the given address, in the order they were inserted in `hosts`.
     /// Note that this always includes the hosts without an address, since they match all addresses.
     /// If no address is provided, returns an iterator over all hosts.
+    /// The hosts `matches_by_address` returns, as shared handles.
+    pub fn matches_by_address_arc(&self, address: Option<&[u8]>) -> Vec<Arc<T::Host>> {
+        let Some(address) = address else {
+            return self.hosts.iter().cloned().collect();
+        };
+        let mut matching_hosts: Vec<usize> = self
+            .hosts_by_address
+            .get(address)
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(self.hosts_without_address.iter().copied())
+            .collect();
+        matching_hosts.sort();
+        matching_hosts
+            .into_iter()
+            .map(|idx| self.hosts[idx].clone())
+            .collect()
+    }
+
     pub fn matches_by_address(
         &self,
         address: Option<&[u8]>,

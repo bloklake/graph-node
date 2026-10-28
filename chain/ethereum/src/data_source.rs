@@ -1504,6 +1504,7 @@ impl UnresolvedMappingEventHandler {
             .resolve(abi_json, Some(&self.event), spec_version)?;
 
         Ok(MappingEventHandler {
+            signature_hash: string_to_b256(&self.event.replace("indexed ", "")),
             event: self.event,
             topic0: self.topic0,
             topic1: self.topic1,
@@ -1519,6 +1520,8 @@ impl UnresolvedMappingEventHandler {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct MappingEventHandler {
     pub event: String,
+    /// The hash of `event` (without `indexed`), computed once: matching a log needs it.
+    pub signature_hash: B256,
     pub topic0: Option<B256>,
     pub topic1: Option<Vec<B256>>,
     pub topic2: Option<Vec<B256>>,
@@ -1557,8 +1560,7 @@ where
 
 impl MappingEventHandler {
     pub fn topic0(&self) -> B256 {
-        self.topic0
-            .unwrap_or_else(|| string_to_b256(&self.event.replace("indexed ", "")))
+        self.topic0.unwrap_or(self.signature_hash)
     }
 
     pub fn matches(&self, log: &Log) -> bool {

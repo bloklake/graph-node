@@ -1,0 +1,439 @@
+[
+ {
+  "type": "event",
+  "name": "SafeSetup",
+  "inputs": [
+   {
+    "name": "initiator",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   },
+   {
+    "name": "owners",
+    "type": "address[]",
+    "internalType": "address[]",
+    "indexed": false
+   },
+   {
+    "name": "threshold",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "initializer",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "fallbackHandler",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "SafeReceived",
+  "inputs": [
+   {
+    "name": "sender",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "SafeModuleTransaction",
+  "inputs": [
+   {
+    "name": "module",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "to",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "data",
+    "type": "bytes",
+    "internalType": "bytes",
+    "indexed": false
+   },
+   {
+    "name": "operation",
+    "type": "uint8",
+    "internalType": "uint8",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "SafeMultiSigTransaction",
+  "inputs": [
+   {
+    "name": "to",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "data",
+    "type": "bytes",
+    "internalType": "bytes",
+    "indexed": false
+   },
+   {
+    "name": "operation",
+    "type": "uint8",
+    "internalType": "uint8",
+    "indexed": false
+   },
+   {
+    "name": "safeTxGas",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "baseGas",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "gasPrice",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "gasToken",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "refundReceiver",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   },
+   {
+    "name": "signatures",
+    "type": "bytes",
+    "internalType": "bytes",
+    "indexed": false
+   },
+   {
+    "name": "additionalInfo",
+    "type": "bytes",
+    "internalType": "bytes",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ExecutionSuccess",
+  "inputs": [
+   {
+    "name": "txHash",
+    "type": "bytes32",
+    "internalType": "bytes32",
+    "indexed": false
+   },
+   {
+    "name": "payment",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ExecutionFailure",
+  "inputs": [
+   {
+    "name": "txHash",
+    "type": "bytes32",
+    "internalType": "bytes32",
+    "indexed": false
+   },
+   {
+    "name": "payment",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedThreshold",
+  "inputs": [
+   {
+    "name": "threshold",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedMasterCopy",
+  "inputs": [
+   {
+    "name": "singleton",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedFallbackHandler",
+  "inputs": [
+   {
+    "name": "handler",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedGuard",
+  "inputs": [
+   {
+    "name": "guard",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedModuleGuard",
+  "inputs": [
+   {
+    "name": "moduleGuard",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "EnabledModule",
+  "inputs": [
+   {
+    "name": "module",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "DisabledModule",
+  "inputs": [
+   {
+    "name": "module",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "AddedOwner",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "RemovedOwner",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "internalType": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ExecutionSuccess",
+  "inputs": [
+   {
+    "name": "txHash",
+    "type": "bytes32",
+    "internalType": "bytes32",
+    "indexed": true
+   },
+   {
+    "name": "payment",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ExecutionFailure",
+  "inputs": [
+   {
+    "name": "txHash",
+    "type": "bytes32",
+    "internalType": "bytes32",
+    "indexed": true
+   },
+   {
+    "name": "payment",
+    "type": "uint256",
+    "internalType": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedFallbackHandler",
+  "inputs": [
+   {
+    "name": "handler",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ChangedGuard",
+  "inputs": [
+   {
+    "name": "guard",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "EnabledModule",
+  "inputs": [
+   {
+    "name": "module",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "DisabledModule",
+  "inputs": [
+   {
+    "name": "module",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "AddedOwner",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "RemovedOwner",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "internalType": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false
+ }
+]

@@ -152,19 +152,56 @@ impl BlockEventStream {
     }
 
     fn write(&mut self, event: &ProofOfIndexingEvent<'_>) {
-        let children = &[
-            1,                // kvp -> v
-            0,                // PoICausalityRegion.blocks: Result<Vec<Block>>
-            self.block_index, // Result<Vec<Block>> -> [i]
-            0,                // Block.events -> Vec<ProofOfIndexingEvent>
-            self.vec_length,
-        ];
+        let children = &event_address(self.block_index, self.vec_length);
         self.hasher.write(&event, children);
         self.vec_length += 1;
     }
 
+    /// Writes the event `contribution` was computed for, if it was computed for the position
+    /// the next event takes. Returns whether it did.
+    fn write_contribution(&mut self, position: u64, contribution: &PoiContribution) -> bool {
+        match &mut self.hasher {
+            Hashers::Fast(hasher) if position == self.vec_length => {
+                hasher.mixin(&contribution.0);
+                self.vec_length += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn start_handler(&mut self) {
         self.handler_start = self.vec_length;
+    }
+}
+
+/// The address of the `position`th event of a causality region in block `block_index`.
+fn event_address(block_index: u64, position: u64) -> [u64; 5] {
+    [
+        1,           // kvp -> v
+        0,           // PoICausalityRegion.blocks: Result<Vec<Block>>
+        block_index, // Result<Vec<Block>> -> [i]
+        0,           // Block.events -> Vec<ProofOfIndexingEvent>
+        position,
+    ]
+}
+
+/// What one event adds to a block's (fast) proof of indexing when it is the `position`th event
+/// of its causality region. The fast hash mixes the hashes of its leaves in any order, so this
+/// can be computed ahead of time, on another thread, and mixed in later: that is the same as
+/// writing the event at that position.
+#[derive(Clone, Debug)]
+pub struct PoiContribution(FastStableHasher);
+
+impl PoiContribution {
+    pub fn new(block_number: BlockNumber, position: u64, event: &ProofOfIndexingEvent<'_>) -> Self {
+        let block_index: u64 = block_number.try_into().unwrap();
+        let addr = event_address(block_index, position)
+            .iter()
+            .fold(u128::root(), |s, i| s.child(*i));
+        let mut hasher = FastStableHasher::new();
+        StableHash::stable_hash(&event, addr, &mut hasher);
+        PoiContribution(hasher)
     }
 }
 
@@ -227,6 +264,23 @@ impl ProofOfIndexing {
         self.with_causality_region(causality_region, |entry| entry.write(event))
     }
 
+    /// Writes the event `contribution` was computed for, if the causality region's next event
+    /// is at `position` and this is a fast proof of indexing. Returns whether it did; if not, the
+    /// caller writes the event with `write`.
+    pub fn write_contribution(
+        &mut self,
+        causality_region: &str,
+        position: u64,
+        contribution: &PoiContribution,
+    ) -> bool {
+        if ENV_VARS.log_poi_events {
+            return false;
+        }
+        self.with_causality_region(causality_region, |entry| {
+            entry.write_contribution(position, contribution)
+        })
+    }
+
     pub fn start_handler(&mut self, causality_region: &str) {
         self.with_causality_region(causality_region, |entry| entry.start_handler())
     }
@@ -236,6 +290,15 @@ impl ProofOfIndexing {
     where
         F: FnOnce(&mut BlockEventStream) -> T,
     {
+        // A block has few causality regions; finding one by comparing names avoids building an
+        // `Id` for every event.
+        let existing = self
+            .per_causality_region
+            .iter_mut()
+            .find(|(id, _)| matches!(id, Id::String(name) if name.as_str() == causality_region));
+        if let Some((_, entry)) = existing {
+            return f(entry);
+        }
         let causality_region = Id::String(causality_region.to_owned().into());
         if let Some(causality_region) = self.per_causality_region.get_mut(&causality_region) {
             f(causality_region)

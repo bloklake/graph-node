@@ -212,12 +212,14 @@ impl NotificationListener {
                     // connection to look up large notifications
                     //
                     // We batch notifications such that we do not wait for
-                    // longer than 500ms for new notifications to arrive,
+                    // longer than 20ms for new notifications to arrive,
                     // but limit the size of each batch to 128 to guarantee
-                    // progress on a busy system
+                    // progress on a busy system. (A longer wait delayed
+                    // every lone notification, such as a new assignment or
+                    // chain head, by that long.)
                     let notifications: Vec<_> = conn
                         .notifications()
-                        .timeout_iter(Duration::from_millis(500))
+                        .timeout_iter(Duration::from_millis(20))
                         .iterator()
                         .take(128)
                         .filter_map(|item| match item {
@@ -237,7 +239,7 @@ impl NotificationListener {
                         .filter(|notification| notification.channel() == channel_name.0)
                         .collect();
 
-                    // Read notifications until there hasn't been one for 500ms
+                    // Read notifications until there hasn't been one for 20ms
                     for notification in notifications {
                         // Terminate the thread if desired
                         if terminate.load(Ordering::SeqCst) {

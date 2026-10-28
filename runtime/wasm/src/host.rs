@@ -7,7 +7,9 @@ use graph::futures03::channel::oneshot::channel;
 
 use graph::blockchain::{Blockchain, HostFn, RuntimeAdapter};
 use graph::components::store::{EnsLookup, SubgraphFork};
-use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
+use graph::components::subgraph::{
+    MappingError, SharedProofOfIndexing, SpeculativeResult, SpeculativeRun,
+};
 use graph::data_source::{
     DataSource, DataSourceTemplate, MappingTrigger, TriggerData, TriggerWithHandler,
 };
@@ -110,6 +112,8 @@ pub struct RuntimeHost<C: Blockchain> {
     mapping_request_sender: Sender<WasmRequest<C>>,
     host_exports: Arc<HostExports>,
     metrics: Arc<HostMetrics>,
+    /// The compiled module and metrics for speculative runs; `None` when speculation is off.
+    speculation: Option<(Arc<crate::mapping::ValidModule>, Arc<HostMetrics>)>,
 }
 
 impl<C> RuntimeHost<C>
@@ -144,12 +148,19 @@ where
 
         let host_fns = runtime_adapter.host_fns(&data_source).unwrap_or_default();
 
+        let speculation = match (ENV_VARS.mappings.speculation_threads, data_source.runtime()) {
+            (0, _) | (_, None) => None,
+            (_, Some(bytes)) => crate::mapping::registered_module(&bytes)
+                .map(|module| (module, Arc::new(metrics.speculative()))),
+        };
+
         Ok(RuntimeHost {
             host_fns: Arc::new(host_fns),
             data_source,
             mapping_request_sender,
             host_exports,
             metrics,
+            speculation,
         })
     }
 
@@ -224,7 +235,10 @@ where
 }
 
 #[async_trait]
-impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
+impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C>
+where
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
+{
     fn data_source(&self) -> &DataSource<C> {
         &self.data_source
     }
@@ -284,6 +298,68 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
 
     fn host_metrics(&self) -> Arc<HostMetrics> {
         self.metrics.cheap_clone()
+    }
+
+    fn can_speculate(&self) -> bool {
+        self.speculation.is_some() && crate::mapping::speculation_enabled()
+    }
+
+    async fn run_speculative(
+        self: Arc<Self>,
+        logger: Logger,
+        trigger: TriggerData<C>,
+        block: Arc<C::Block>,
+        state: BlockState,
+        worth_running: Arc<dyn Fn(String) -> bool + Send + Sync>,
+    ) -> Result<SpeculativeRun, MappingError> {
+        let Some((module, metrics)) = self.speculation.clone() else {
+            return Err(MappingError::Unknown(anyhow!("speculation is off")));
+        };
+        let mapping_trigger = match self.data_source.match_and_decode(&trigger, &block, &logger) {
+            Ok(Some(mapping_trigger)) => mapping_trigger,
+            Ok(None) => return Ok(SpeculativeRun::NotMatched),
+            Err(e) => return Err(MappingError::Unknown(e)),
+        };
+        let handler = mapping_trigger.handler_name().to_string();
+        if !worth_running(handler.clone()) {
+            return Ok(SpeculativeRun::Skipped { handler });
+        }
+        let Some(_permit) = crate::mapping::speculation_permit().await else {
+            return Err(MappingError::Unknown(anyhow!("speculation is off")));
+        };
+        let ctx = MappingContext {
+            logger: logger.cheap_clone(),
+            host_exports: self.host_exports.cheap_clone(),
+            block_ptr: mapping_trigger.block_ptr(),
+            timestamp: mapping_trigger.timestamp(),
+            state,
+            // The runner writes the proof of indexing events when it replays the writes.
+            proof_of_indexing: SharedProofOfIndexing::ignored(),
+            host_fns: self.host_fns.cheap_clone(),
+            debug_fork: None,
+            mapping_logger: Logger::new(&logger, o!("component" => "UserMapping")),
+            instrument: false,
+        };
+        let experimental_features = ExperimentalFeatures {
+            allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
+        };
+        let state = crate::mapping::run_speculative(
+            module,
+            ctx,
+            mapping_trigger,
+            metrics,
+            experimental_features,
+        )
+        .await?;
+        // Drop the rest of the run's block state here, not on the runner's thread.
+        let result = SpeculativeResult::from_state(state).ok_or_else(|| {
+            MappingError::Unknown(anyhow!("speculative run lost its speculation log"))
+        })?;
+        Ok(SpeculativeRun::Ran { result, handler })
+    }
+
+    fn poi_causality_region(&self) -> Option<&str> {
+        Some(&self.host_exports.poi_causality_region)
     }
 }
 

@@ -1,0 +1,27 @@
+type Account @entity(immutable: false) {
+  id: Bytes!
+  balance: BigInt!
+}
+
+type Allowance @entity(immutable: false) {
+  id: Bytes!
+  owner: Bytes!
+  spender: Bytes!
+  amount: BigInt!
+}
+
+type TransferEvent @entity(immutable: true) {
+  id: Bytes!
+  from: Bytes!
+  to: Bytes!
+  amount: BigInt!
+  timestamp: Int!
+}
+
+type ApprovalEvent @entity(immutable: true) {
+  id: Bytes!
+  owner: Bytes!
+  spender: Bytes!
+  amount: BigInt!
+  timestamp: Int!
+}

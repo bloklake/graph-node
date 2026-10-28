@@ -28,10 +28,9 @@ pub struct ArrayBuffer {
 
 impl ArrayBuffer {
     pub fn new<T: AscType>(values: &[T]) -> Result<Self, DeterministicHostError> {
-        let mut content = Vec::new();
+        let mut content = Vec::with_capacity(size_of_val(values));
         for value in values {
-            let asc_bytes = value.to_asc_bytes()?;
-            content.extend(&asc_bytes);
+            value.append_asc_bytes(&mut content)?;
         }
 
         if content.len() > u32::MAX as usize {
@@ -57,25 +56,20 @@ impl ArrayBuffer {
         let length = length as usize;
         let byte_offset = byte_offset as usize;
 
-        self.content[byte_offset..]
-            .chunks(size_of::<T>())
-            .take(length)
-            .map(|asc_obj| T::from_asc_bytes(asc_obj, api_version))
-            .collect()
+        T::vec_from_asc_bytes(&self.content[byte_offset..], length, api_version)
     }
 }
 
 impl AscType for ArrayBuffer {
     fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError> {
-        let mut asc_layout: Vec<u8> = Vec::new();
-
-        asc_layout.extend(self.content.iter());
-
         // Allocate extra capacity to next power of two, as required by asc.
         let total_size = self.byte_length as usize + HEADER_SIZE;
         let total_capacity = total_size.next_power_of_two();
         let extra_capacity = total_capacity - total_size;
-        asc_layout.extend(std::iter::repeat_n(0, extra_capacity));
+
+        let mut asc_layout: Vec<u8> = Vec::with_capacity(self.content.len() + extra_capacity);
+        asc_layout.extend_from_slice(&self.content);
+        asc_layout.resize(self.content.len() + extra_capacity, 0);
 
         Ok(asc_layout)
     }

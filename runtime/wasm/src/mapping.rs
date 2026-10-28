@@ -34,6 +34,7 @@ where
     static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     let valid_module = Arc::new(ValidModule::new(&logger, raw_module, timeout)?);
+    register_module(raw_module, &valid_module);
 
     // Create channel for event handling requests
     let (mapping_request_sender, mapping_request_receiver) = mpsc::channel(100);
@@ -120,6 +121,152 @@ where
     .context("Spawning WASM runtime thread failed")?;
 
     Ok(mapping_request_sender)
+}
+
+/// Compiled modules by the keccak hash of their bytes, so every host running the same module
+/// finds it for speculative runs. `buffers` remembers the hash of each module buffer hosts were
+/// built from (holding the buffer, so its address is not reused for other bytes).
+struct ModuleRegistry {
+    by_hash: HashMap<[u8; 32], std::sync::Weak<ValidModule>>,
+    buffers: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])>,
+}
+
+static MODULES: std::sync::LazyLock<std::sync::Mutex<ModuleRegistry>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(ModuleRegistry {
+            by_hash: HashMap::new(),
+            buffers: HashMap::new(),
+        })
+    });
+
+fn module_hash(raw_module: &[u8]) -> [u8; 32] {
+    graph::prelude::alloy::primitives::keccak256(raw_module).0
+}
+
+fn register_module(raw_module: &[u8], module: &Arc<ValidModule>) {
+    let hash = module_hash(raw_module);
+    let mut modules = MODULES.lock().unwrap();
+    modules
+        .by_hash
+        .retain(|_, module| module.strong_count() > 0);
+    modules.by_hash.insert(hash, Arc::downgrade(module));
+}
+
+/// The module compiled from these bytes, if it is still alive.
+pub(crate) fn registered_module(raw_module: &Arc<Vec<u8>>) -> Option<Arc<ValidModule>> {
+    let address = Arc::as_ptr(raw_module) as usize;
+    let known = MODULES
+        .lock()
+        .unwrap()
+        .buffers
+        .get(&address)
+        .map(|(_, hash)| *hash);
+    let hash = match known {
+        Some(hash) => hash,
+        None => {
+            let hash = module_hash(raw_module);
+            let mut modules = MODULES.lock().unwrap();
+            // Keep the table from growing without bound as data sources come and go.
+            if modules.buffers.len() > 10_000 {
+                modules.buffers.clear();
+            }
+            modules
+                .buffers
+                .insert(address, (raw_module.cheap_clone(), hash));
+            hash
+        }
+    };
+    MODULES
+        .lock()
+        .unwrap()
+        .by_hash
+        .get(&hash)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// The runtime speculative handler runs execute on (`GRAPH_SPECULATION_THREADS` workers), and
+/// the limit on how many are in flight (`GRAPH_SPECULATION_CONCURRENCY`). Runs are tasks, not
+/// threads: a run waiting on a host call (an `eth_call`, say) yields its worker, so many can
+/// wait at once while only a few execute. `None` when speculation is off.
+fn speculation_runtime() -> Option<&'static (tokio::runtime::Runtime, Arc<tokio::sync::Semaphore>)>
+{
+    static RUNTIME: std::sync::OnceLock<
+        Option<(tokio::runtime::Runtime, Arc<tokio::sync::Semaphore>)>,
+    > = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let threads = ENV_VARS.mappings.speculation_threads;
+            if threads == 0 {
+                return None;
+            }
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .thread_name("speculation")
+                .enable_all()
+                .build()
+                .expect("building the speculation runtime");
+            let permits = ENV_VARS.mappings.speculation_concurrency.max(1);
+            Some((runtime, Arc::new(tokio::sync::Semaphore::new(permits))))
+        })
+        .as_ref()
+}
+
+/// Spawns `run` on the speculation runtime; `false` when speculation is off. Runs take a
+/// `speculation_permit` before they instantiate a module.
+pub fn spawn_speculative<F>(run: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some((runtime, _)) = speculation_runtime() else {
+        return false;
+    };
+    runtime.spawn(run);
+    true
+}
+
+/// Whether speculative runs are on.
+pub fn speculation_enabled() -> bool {
+    speculation_runtime().is_some()
+}
+
+/// Waits for one of the `GRAPH_SPECULATION_CONCURRENCY` slots for a run in flight.
+pub(crate) async fn speculation_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let (_, permits) = speculation_runtime()?;
+    permits.clone().acquire_owned().await.ok()
+}
+
+/// Instantiates the module and runs `trigger`, as a speculative run does.
+pub(crate) async fn run_speculative<C: Blockchain>(
+    valid_module: Arc<ValidModule>,
+    ctx: MappingContext,
+    trigger: TriggerWithHandler<MappingTrigger<C>>,
+    host_metrics: Arc<HostMetrics>,
+    experimental_features: ExperimentalFeatures,
+) -> Result<BlockState, MappingError>
+where
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
+{
+    let run = async move {
+        let module = WasmInstance::from_valid_module_with_ctx(
+            valid_module,
+            ctx,
+            host_metrics,
+            experimental_features,
+        )
+        .await
+        .map_err(MappingError::Unknown)?;
+        module
+            .handle_trigger(trigger)
+            .await
+            .map(|(state, _gas)| state)
+    };
+    graph::futures03::FutureExt::catch_unwind(AssertUnwindSafe(run))
+        .await
+        .unwrap_or_else(|_| {
+            Err(MappingError::Unknown(anyhow!(
+                "speculative handler run panicked"
+            )))
+        })
 }
 
 async fn instantiate_module<C: Blockchain>(
@@ -224,6 +371,68 @@ impl MappingContext {
 // See the start_index comment below for more information.
 const GN_START_FUNCTION_NAME: &str = "gn::start";
 
+/// Type id indexes below this are cached in a lock-free table.
+const ASC_TYPE_ID_SLOTS: usize = 8192;
+/// Marks a slot of that table whose type id is not known yet.
+const UNKNOWN_TYPE_ID: u32 = u32::MAX;
+
+/// The engine every module is compiled for. Sharing it lets all instances come from one
+/// pool (`GRAPH_WASM_INSTANCE_POOL`), so a trigger's instance reuses memory instead of mapping
+/// and unmapping a fresh reservation.
+fn shared_engine() -> Result<wasmtime::Engine, anyhow::Error> {
+    static ENGINE: std::sync::OnceLock<Result<wasmtime::Engine, String>> =
+        std::sync::OnceLock::new();
+    ENGINE
+        .get_or_init(|| build_engine().map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow!("creating the WASM engine failed: {e}"))
+}
+
+fn build_engine() -> Result<wasmtime::Engine, anyhow::Error> {
+    // We use Cranelift as a compilation engine. Cranelift is an optimizing compiler, but that
+    // should not cause determinism issues since it adheres to the Wasm spec and NaN
+    // canonicalization is enabled below. The optimization level is configurable via
+    // GRAPH_WASM_OPT_LEVEL (default: speed).
+    let mut config = wasmtime::Config::new();
+    config.strategy(wasmtime::Strategy::Cranelift);
+    config.epoch_interruption(true);
+    config.cranelift_nan_canonicalization(true); // For NaN determinism.
+    config.cranelift_opt_level(match ENV_VARS.mappings.wasm_opt_level {
+        graph::env::WasmOptLevel::None => wasmtime::OptLevel::None,
+        graph::env::WasmOptLevel::Speed => wasmtime::OptLevel::Speed,
+        graph::env::WasmOptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
+    });
+    config.max_wasm_stack(ENV_VARS.mappings.max_stack_size);
+
+    let slots = ENV_VARS.mappings.wasm_instance_pool;
+    if slots > 0 {
+        // Every speculative run in flight holds an instance, and so do the runners' own runs;
+        // a pool smaller than that makes runs fail to start (and run again, one at a time).
+        let slots = if ENV_VARS.mappings.speculation_threads > 0 {
+            let wanted = ENV_VARS
+                .mappings
+                .speculation_concurrency
+                .saturating_add(256);
+            slots.max(u32::try_from(wanted).unwrap_or(u32::MAX))
+        } else {
+            slots
+        };
+        let mut pool = wasmtime::PoolingAllocationConfig::default();
+        pool.total_core_instances(slots)
+            .total_memories(slots)
+            .total_tables(slots)
+            .total_stacks(slots)
+            // Mappings keep their state small; zeroing the first MiB on reuse is cheaper
+            // than faulting the pages back in.
+            .linear_memory_keep_resident(1 << 20)
+            .table_keep_resident(1 << 16)
+            .table_elements(1 << 20)
+            .max_core_instance_size(1 << 22);
+        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pool));
+    }
+    Ok(wasmtime::Engine::new(&config)?)
+}
+
 /// A pre-processed and valid WASM module, ready to be started as a WasmModule.
 pub struct ValidModule {
     pub module: wasmtime::Module,
@@ -258,6 +467,9 @@ pub struct ValidModule {
     /// Cache for asc_type_id results. Maps IndexForAscTypeId to their WASM runtime
     /// type IDs. Populated lazily on first use; deterministic per compiled module.
     asc_type_id_cache: RwLock<HashMap<IndexForAscTypeId, u32>>,
+    /// Type ids for the (dense, small) indexes of real types, readable without a lock;
+    /// every speculation thread looks them up for every object it creates.
+    asc_type_ids: Box<[std::sync::atomic::AtomicU32]>,
 }
 
 impl ValidModule {
@@ -308,22 +520,7 @@ impl ValidModule {
                 .map_err(|_| anyhow!("Failed to inject gas counter"))?;
         let raw_module = parity_module.into_bytes()?;
 
-        // We use Cranelift as a compilation engine. Cranelift is an optimizing compiler, but that
-        // should not cause determinism issues since it adheres to the Wasm spec and NaN
-        // canonicalization is enabled below. The optimization level is configurable via
-        // GRAPH_WASM_OPT_LEVEL (default: speed).
-        let mut config = wasmtime::Config::new();
-        config.strategy(wasmtime::Strategy::Cranelift);
-        config.epoch_interruption(true);
-        config.cranelift_nan_canonicalization(true); // For NaN determinism.
-        config.cranelift_opt_level(match ENV_VARS.mappings.wasm_opt_level {
-            graph::env::WasmOptLevel::None => wasmtime::OptLevel::None,
-            graph::env::WasmOptLevel::Speed => wasmtime::OptLevel::Speed,
-            graph::env::WasmOptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
-        });
-        config.max_wasm_stack(ENV_VARS.mappings.max_stack_size);
-
-        let engine = &wasmtime::Engine::new(&config)?;
+        let engine = &shared_engine()?;
         let module = wasmtime::Module::from_binary(engine, &raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -339,21 +536,21 @@ impl ValidModule {
                 .push(module.to_string());
         }
 
-        let mut epoch_counter_abort_handle = None;
+        // Timeouts on instantiated modules trigger on epoch deltas; one task advances the
+        // shared engine's epoch every `timeout` (the timeout is the same for every module).
+        // See also: runtime-timeouts
+        let epoch_counter_abort_handle = None;
         if let Some(timeout) = timeout {
+            static EPOCH_COUNTER: std::sync::Once = std::sync::Once::new();
             let engine = engine.clone();
-
-            // The epoch counter task will perpetually increment the epoch every `timeout` seconds.
-            // Timeouts on instantiated modules will trigger on epoch deltas.
-            // Note: The epoch is an u64 so it will never overflow.
-            // See also: runtime-timeouts
-            let epoch_counter = async move {
-                loop {
-                    tokio::time::sleep(timeout).await;
-                    engine.increment_epoch();
-                }
-            };
-            epoch_counter_abort_handle = Some(graph::spawn(epoch_counter).abort_handle());
+            EPOCH_COUNTER.call_once(move || {
+                graph::spawn(async move {
+                    loop {
+                        tokio::time::sleep(timeout).await;
+                        engine.increment_epoch();
+                    }
+                });
+            });
         }
 
         let linker = crate::module::build_linker(engine, &import_name_to_modules)?;
@@ -367,15 +564,27 @@ impl ValidModule {
             timeout,
             epoch_counter_abort_handle,
             asc_type_id_cache: RwLock::new(HashMap::new()),
+            asc_type_ids: (0..ASC_TYPE_ID_SLOTS)
+                .map(|_| std::sync::atomic::AtomicU32::new(UNKNOWN_TYPE_ID))
+                .collect(),
         })
     }
 
     pub fn get_cached_type_id(&self, idx: IndexForAscTypeId) -> Option<u32> {
+        if let Some(slot) = self.asc_type_ids.get(idx as usize) {
+            let id = slot.load(Ordering::Relaxed);
+            return (id != UNKNOWN_TYPE_ID).then_some(id);
+        }
         self.asc_type_id_cache.read().get(&idx).copied()
     }
 
     pub fn cache_type_id(&self, idx: IndexForAscTypeId, type_id: u32) {
-        self.asc_type_id_cache.write().insert(idx, type_id);
+        match self.asc_type_ids.get(idx as usize) {
+            Some(slot) if type_id != UNKNOWN_TYPE_ID => slot.store(type_id, Ordering::Relaxed),
+            _ => {
+                self.asc_type_id_cache.write().insert(idx, type_id);
+            }
+        }
     }
 }
 

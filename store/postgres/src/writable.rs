@@ -428,6 +428,16 @@ impl SyncStore {
         .await
     }
 
+    pub(crate) async fn has_entities(&self) -> Result<bool, StoreError> {
+        retry::forever(&self.logger, "has_entities", || async {
+            self.writable
+                .entity_count(self.site.cheap_clone())
+                .await
+                .map(|count| count > 0)
+        })
+        .await
+    }
+
     async fn maybe_find_site(&self, src: DeploymentId) -> Result<Option<Arc<Site>>, StoreError> {
         match self.store.find_site(src).await {
             Ok(site) => Ok(Some(site)),
@@ -1879,6 +1889,12 @@ impl WritableStoreTrait for WritableStore {
         // It should be empty when we call this, but just in case.
         self.writer.flush().await?;
         self.store.causality_region_curr_val().await
+    }
+
+    async fn has_entities(&self) -> Result<bool, StoreError> {
+        // Count what is queued too.
+        self.writer.flush().await?;
+        self.store.has_entities().await
     }
 
     fn shard(&self) -> &str {

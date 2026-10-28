@@ -610,6 +610,11 @@ impl WasmInstanceContext<'_> {
             )));
         }
 
+        if let Some(log) = self.as_mut().ctx.state.speculation.as_mut() {
+            // The callbacks' states are merged in wholesale; not replayable op by op.
+            log.unsupported = true;
+        }
+
         let link: String = asc_get(self, link_ptr, gas)?;
         let callback: String = asc_get(self, callback, gas)?;
         let user_data: store::Value = asc_get(self, user_data, gas)?;

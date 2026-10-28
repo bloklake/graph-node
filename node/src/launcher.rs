@@ -27,8 +27,8 @@ use graph_server_index_node::IndexNodeServer;
 use graph_server_json_rpc::JsonRpcServer;
 use graph_server_metrics::PrometheusMetricsServer;
 use graph_store_postgres::{
-    ChainHeadUpdateListener, ConnectionPool, NotificationSender, Store, SubgraphStore,
-    SubscriptionManager, register_jobs as register_store_jobs,
+    ChainHeadUpdateListener, ConnectionPool, NotificationSender, PgContentStore, Store,
+    SubgraphStore, SubscriptionManager, register_jobs as register_store_jobs,
 };
 use graphman_server::GraphmanServer;
 use graphman_server::GraphmanServerConfig;
@@ -529,6 +529,16 @@ pub async fn run(
             metrics_registry.cheap_clone(),
         )
         .await;
+
+    if graph::ipfs::builtin::is_builtin(&opt.ipfs) {
+        info!(
+            logger,
+            "Subgraph files are kept in the primary database; add them through the admin server's /api/v0/add"
+        );
+        graph::ipfs::builtin::set_content_store(Arc::new(PgContentStore::new(
+            primary_pool.clone(),
+        )));
+    }
 
     let graphman_server_config = make_graphman_server_config(
         primary_pool.clone(),

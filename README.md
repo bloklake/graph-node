@@ -160,8 +160,13 @@ Here's [a list of good first issues](https://github.com/graphprotocol/graph-node
 
 ## License
 
+This is Bloklake's fork of graph-node. Bloklake's changes are licensed under the
+[Elastic License 2.0](LICENSE-ELASTIC): you may use and run them yourself, but not offer them to
+others as a hosted or managed service. See [LICENSING.md](LICENSING.md) for which code is under
+which license.
+
 Copyright &copy; 2018-2019 Graph Protocol, Inc. and contributors.
 
-The Graph is dual-licensed under the [MIT license](LICENSE-MIT) and the [Apache License, Version 2.0](LICENSE-APACHE).
+Upstream graph-node is dual-licensed under the [MIT license](LICENSE-MIT) and the [Apache License, Version 2.0](LICENSE-APACHE).
 
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either expressed or implied. See the License for the specific language governing permissions and limitations under the License.
