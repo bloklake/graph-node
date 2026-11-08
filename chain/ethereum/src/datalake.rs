@@ -676,15 +676,13 @@ const TRANSACTION_FIELDS: &[&str] = &[
     "maxFeePerGas",
     "maxPriorityFeePerGas",
     "type",
-    "accessList",
     "chainId",
-    "v",
-    "r",
-    "s",
-    "yParity",
-    "maxFeePerBlobGas",
-    "blobVersionedHashes",
 ];
+// Not requested: the signature (`v`, `r`, `s`, `yParity`), `accessList`, `maxFeePerBlobGas` and
+// `blobVersionedHashes`. Mappings never see them (`EthereumTransactionData` exposes hash, index,
+// from, to, value, gas limit, effective gas price, input and nonce), the envelope is built with
+// `new_unchecked` (no signature check, the hash is given), and datalake blocks are not written to
+// the chain store. Leaving them out is ~10% of a backfill's bytes.
 
 const LOG_FIELDS: &[&str] = &[
     "blockNumber",
@@ -806,9 +804,10 @@ fn transactions(
         let ty = c.get::<UInt8Array>("type")?;
         let access = c.opt::<ListArray>("access_list");
         let chain_id = c.opt::<UInt64Array>("chain_id");
-        let v = c.u64("v")?;
-        let r = c.fixed("r")?;
-        let s = c.fixed("s")?;
+        // Not requested (see TRANSACTION_FIELDS); read when present, else a placeholder.
+        let v = c.opt::<UInt64Array>("v");
+        let r = c.opt::<FixedSizeBinaryArray>("r");
+        let s = c.opt::<FixedSizeBinaryArray>("s");
         let y_parity = c.opt::<UInt8Array>("y_parity");
         let max_fee_blob = c.opt::<FixedSizeBinaryArray>("max_fee_per_blob_gas");
         let blob_hashes = c.opt::<ListArray>("blob_versioned_hashes");
@@ -827,9 +826,11 @@ fn transactions(
             let chain_id = opt_u64(chain_id, i);
             let y = y_parity.filter(|a| !a.is_null(i)).map(|a| a.value(i));
             let signature = Signature::new(
-                U256::from_be_slice(r.value(i)),
-                U256::from_be_slice(s.value(i)),
-                parity(y, v.value(i)),
+                r.filter(|a| !a.is_null(i))
+                    .map_or(U256::ZERO, |a| U256::from_be_slice(a.value(i))),
+                s.filter(|a| !a.is_null(i))
+                    .map_or(U256::ZERO, |a| U256::from_be_slice(a.value(i))),
+                parity(y, opt_u64(v, i).unwrap_or(0)),
             );
             let max_fee_per_gas = opt_u128(max_fee, i).unwrap_or(0);
             let max_priority_fee_per_gas = opt_u128(max_priority, i).unwrap_or(0);
@@ -837,8 +838,7 @@ fn transactions(
                 0 => TxEnvelope::Legacy(Signed::new_unchecked(
                     TxLegacy {
                         chain_id: chain_id.or_else(|| {
-                            let v = v.value(i);
-                            (v >= 35).then(|| (v - 35) / 2)
+                            opt_u64(v, i).and_then(|v| (v >= 35).then(|| (v - 35) / 2))
                         }),
                         nonce,
                         gas_price: opt_u128(gas_price, i).unwrap_or(0),
