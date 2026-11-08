@@ -45,9 +45,9 @@ count matches the same app written for Ponder.
 Setup: a 2-vCPU ARM server, each run capped at 1.5 CPUs and 2 GB of memory (several runs reached
 the cap), Postgres 16 on the same machine, the production API with an ordinary key. The
 comparison with upstream graph-node over JSON-RPC on the same machine is running and will be
-added here. The fork receives the full transaction behind every matched log, `input` included,
-which is why it moves more data than the Ponder fork for the same contracts; trimming that is
-planned.
+added here. These runs predate a fix to the datalake prefetch (`aa66c3d`): the fork read most
+blocks about four times, so the data figures above overstate what it now receives; they will be
+replaced with re-measured ones.
 
 ### Build
 
