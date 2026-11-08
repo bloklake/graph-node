@@ -4,6 +4,68 @@
 [![Docs](https://img.shields.io/badge/docs-graph--node-green.svg)](docs/)
 [![Subgraphs](https://img.shields.io/badge/docs-subgraphs-green.svg)](https://thegraph.com/docs/en/subgraphs/quick-start/)
 
+## Bloklake fork
+
+This is [Bloklake](https://www.bloklake.com/indexers)'s fork of graph-node. For block ranges the
+Bloklake API has fully ingested, it reads log triggers from the API instead of JSON-RPC: one
+request returns the matching logs with their transactions and block headers. Your subgraph
+(manifest, schema and mappings) is unchanged; the node's config gains a `datalake` line on the
+chain:
+
+```toml
+[chains.mainnet]
+shard = "primary"
+provider = [ { label = "rpc", url = "https://your-rpc.example", features = [] } ]
+datalake = { url = "https://eth.api.bloklake.com", api_key = "bl_live_..." }  # rh.api.bloklake.com for Robinhood Chain
+```
+
+JSON-RPC is still used for the chain head, blocks after the API's archive height, call and block
+handlers, and receipts when a handler asks for them. Requests stay under the API key's in-flight
+limit (`max_concurrent_requests`, default 4); a `429` waits for `Retry-After` and is not counted
+as a failure.
+
+### Benchmark
+
+The fork over the Bloklake API on 10 subgraphs (November 2026), fresh database. Every table's row
+count matches the same app written for Ponder.
+
+| Workload | Blocks | Time · data received | Peak memory |
+|---|---|---|---|
+| USDC transfers | 7,000 | 185 s · 2.6 GB | 1,941 MB |
+| USDT balances | 6,000 | 1,101 s · 2.9 GB | 1,831 MB |
+| WETH balances + daily volume | 12,000 | 250 s · 2.7 GB | 1,848 MB |
+| Every ERC-20 transfer | 500 | 156 s · 2.3 GB | 2,029 MB |
+| Uniswap v4 (PoolManager) | 20,000 | 449 s · 3.4 GB | 2,048 MB |
+| Uniswap v3 (9 pools) | 200,000 | 308 s · 5.0 GB | 2,048 MB |
+| Aave v3 | 300,000 | 320 s · 1.9 GB | 1,723 MB |
+| Lido stETH | 400,000 | 157 s · 1.3 GB | 1,242 MB |
+| Every ERC-20 transfer (Robinhood Chain) | 150,000 | 423 s · 1.9 GB | 1,280 MB |
+| DEX factories v2 + v3 (Robinhood Chain) | 500,000 | 238 s · 19.6 GB | 2,053 MB |
+
+Setup: a 2-vCPU ARM server, each run capped at 1.5 CPUs and 2 GB of memory (several runs reached
+the cap), Postgres 16 on the same machine, the production API with an ordinary key. The
+comparison with upstream graph-node over JSON-RPC on the same machine is running and will be
+added here. The fork receives the full transaction behind every matched log, `input` included,
+which is why it moves more data than the Ponder fork for the same contracts; trimming that is
+planned.
+
+### Build
+
+```bash
+git clone https://github.com/bloklake/graph-node
+cd graph-node
+cargo build --release --locked -p graph-node   # needs protoc and libpq, like upstream
+./target/release/graph-node --config config.toml --ipfs http://127.0.0.1:5001
+```
+
+You need a Bloklake API key: [get one in the dashboard](https://dashboard.bloklake.com). Upstream
+graph-node is MIT or Apache 2.0; Bloklake's changes are under the Elastic License 2.0 (see
+[LICENSING.md](LICENSING.md)): you may run and modify them, including commercially, for your own
+indexers, but not offer them as a hosted indexing service. [UPSTREAM.md](UPSTREAM.md) says how the
+fork tracks upstream.
+
+The rest of this README is upstream's.
+
 ## Overview
 
 [The Graph](https://thegraph.com/) is a decentralized protocol that organizes and distributes blockchain data across the leading Web3 networks. A key component of The Graph's tech stack is Graph Node.
