@@ -12,7 +12,8 @@
 //! cache.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
@@ -35,7 +36,7 @@ use graph::prelude::alloy::primitives::{
 use graph::prelude::alloy::rpc::types::{Block, BlockTransactions, Header, Log};
 use graph::prelude::{BlockNumber, Logger, anyhow, debug, reqwest, serde_json, warn};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{EthGetLogsFilter, EthereumLogFilter, TriggerFilter};
@@ -64,6 +65,117 @@ pub struct DatalakeSettings {
     /// are indexed from the datalake even within the reorg threshold of the chain head.
     #[serde(default = "default_true")]
     pub trust_finalized: bool,
+    /// Requests in flight at once, shared by every chain using the same API key (the server
+    /// rejects more with `429 too_many_in_flight`). Lowered automatically when the server
+    /// reports a lower limit.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+}
+
+fn default_max_concurrent_requests() -> usize {
+    DEFAULT_MAX_CONCURRENT_REQUESTS
+}
+
+/// The server's default per-key in-flight limit.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 4;
+/// How long a request keeps waiting out `429`s (throttling, not failures) before the range
+/// falls back to JSON-RPC.
+const THROTTLE_BUDGET: Duration = Duration::from_secs(300);
+
+/// Requests in flight for one API key (one URL without a key). The server counts a key's
+/// requests across all of its chains, so every client using the key shares the permits.
+struct Limiter {
+    permits: Arc<Semaphore>,
+    max: AtomicUsize,
+}
+
+impl Limiter {
+    fn for_settings(settings: &DatalakeSettings) -> Arc<Limiter> {
+        static LIMITERS: LazyLock<std::sync::Mutex<HashMap<String, Arc<Limiter>>>> =
+            LazyLock::new(Default::default);
+        let key = match &settings.api_key {
+            Some(k) => format!("key:{k}"),
+            None => format!("url:{}", settings.url.trim_end_matches('/')),
+        };
+        let max = settings.max_concurrent_requests.max(1);
+        let mut limiters = LIMITERS.lock().unwrap();
+        let limiter = limiters
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Limiter {
+                    permits: Arc::new(Semaphore::new(max)),
+                    max: AtomicUsize::new(max),
+                })
+            })
+            .clone();
+        limiter.lower_to(max);
+        limiter
+    }
+
+    async fn acquire(&self) -> OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the datalake limiter is never closed")
+    }
+
+    /// Lowers the limit; permits in use are taken out of circulation as they come back.
+    fn lower_to(&self, limit: usize) {
+        let limit = limit.max(1);
+        let old = self.max.fetch_min(limit, Ordering::Relaxed);
+        if limit < old {
+            let permits = self.permits.clone();
+            let n = (old - limit) as u32;
+            let take = async move {
+                if let Ok(p) = permits.acquire_many_owned(n).await {
+                    p.forget();
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(take);
+                }
+                Err(_) => {
+                    let forgotten = self.permits.forget_permits(n as usize);
+                    debug_assert!(forgotten <= n as usize);
+                }
+            }
+        }
+    }
+}
+
+/// A `429` from the datalake: wait `retry_after`, then try again (not counted as a failure).
+#[derive(Debug)]
+struct Throttled {
+    retry_after: Duration,
+    text: String,
+}
+
+impl std::fmt::Display for Throttled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "datalake answered 429 Too Many Requests: {}", self.text)
+    }
+}
+
+impl std::error::Error for Throttled {}
+
+/// The limit in a `too_many_in_flight` message (`4 requests of this key are still in flight`).
+fn in_flight_limit(text: &str) -> Option<usize> {
+    let body: serde_json::Value = serde_json::from_str(text).ok()?;
+    let error = body.get("error")?;
+    if error.get("code")?.as_str()? != "too_many_in_flight" {
+        return None;
+    }
+    let message = error.get("message")?.as_str()?;
+    message
+        .split_once(" requests of this key")?
+        .0
+        .trim()
+        .rsplit(' ')
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn default_true() -> bool {
@@ -94,6 +206,7 @@ const ATTEMPTS: u32 = 4;
 pub struct DatalakeClient {
     settings: DatalakeSettings,
     http: reqwest::Client,
+    limiter: Arc<Limiter>,
     height: Mutex<Option<(Instant, Heights)>>,
     /// Scans started ahead of time, by filter fingerprint and first block, with the last block
     /// they were asked for.
@@ -159,6 +272,7 @@ impl DatalakeClient {
             .pool_max_idle_per_host(16)
             .build()?;
         Ok(Self {
+            limiter: Limiter::for_settings(&settings),
             settings,
             http,
             height: Mutex::new(None),
@@ -187,13 +301,15 @@ impl DatalakeClient {
             return Ok(heights);
         }
         let url = format!("{}/status", self.settings.url.trim_end_matches('/'));
-        let status: Status = self
-            .request(self.http.get(url))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let status: Status = {
+            let _permit = self.limiter.acquire().await;
+            self.request(self.http.get(url))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        };
         let number =
             |h: Option<u64>| h.map(|h| BlockNumber::try_from(h).unwrap_or(BlockNumber::MAX));
         let heights = Heights {
@@ -223,8 +339,24 @@ impl DatalakeClient {
 
     async fn query_once(&self, body: &serde_json::Value) -> anyhow::Result<Answer> {
         let url = format!("{}/query", self.settings.url.trim_end_matches('/'));
+        // The permit is held until the whole body is read.
+        let _permit = self.limiter.acquire().await;
         let resp = self.request(self.http.post(url)).json(body).send().await?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(1));
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(limit) = in_flight_limit(&text) {
+                self.limiter.lower_to(limit);
+            }
+            return Err(Throttled { retry_after, text }.into());
+        }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("datalake answered {status}: {text}"));
@@ -235,6 +367,7 @@ impl DatalakeClient {
     async fn query(&self, logger: &Logger, body: &serde_json::Value) -> anyhow::Result<Answer> {
         let mut delay = Duration::from_millis(100);
         let mut attempt = 1;
+        let started = Instant::now();
         loop {
             match self.query_once(body).await {
                 Ok(answer) => {
@@ -247,6 +380,16 @@ impl DatalakeClient {
                             "fields" => answer.unavailable_fields.join(","));
                     }
                     return Ok(answer);
+                }
+                // Throttling is not a failure: wait as told, without using up an attempt.
+                Err(e)
+                    if e.downcast_ref::<Throttled>().is_some()
+                        && started.elapsed() < THROTTLE_BUDGET =>
+                {
+                    let wait = e.downcast_ref::<Throttled>().unwrap().retry_after;
+                    debug!(logger, "Datalake throttled the query, waiting";
+                        "wait_ms" => wait.as_millis() as u64, "error" => format!("{e:#}"));
+                    tokio::time::sleep(wait.max(Duration::from_millis(100))).await;
                 }
                 Err(e) if attempt < ATTEMPTS => {
                     warn!(logger, "Datalake query failed, retrying";
@@ -1237,6 +1380,65 @@ pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Arc<Log>]) -> HashMap<B2
 
 #[cfg(test)]
 mod tests {
+    use graph::prelude::serde_json;
+
+    #[test]
+    fn in_flight_limit_from_429_body() {
+        let body = r#"{"error":{"code":"too_many_in_flight","message":"4 requests of this key are still in flight; wait for one to finish"}}"#;
+        assert_eq!(super::in_flight_limit(body), Some(4));
+        let other = r#"{"error":{"code":"rate_limited","message":"rate limit of 50 requests/second exceeded"}}"#;
+        assert_eq!(super::in_flight_limit(other), None);
+        assert_eq!(super::in_flight_limit("not json"), None);
+    }
+
+    async fn max_in_flight(limiter: std::sync::Arc<super::Limiter>) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let now = std::sync::Arc::new(AtomicUsize::new(0));
+        let max = std::sync::Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let (limiter, now, max) = (limiter.clone(), now.clone(), max.clone());
+                tokio::spawn(async move {
+                    let _p = limiter.acquire().await;
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    now.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        max.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn limiter_is_shared_per_key_and_can_be_lowered() {
+        let settings = |url: &str| -> super::DatalakeSettings {
+            serde_json::from_value(serde_json::json!({
+                "url": url, "api_key": "test-limiter-key", "max_concurrent_requests": 3
+            }))
+            .unwrap()
+        };
+        let a = super::Limiter::for_settings(&settings("http://a"));
+        let b = super::Limiter::for_settings(&settings("http://b"));
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "same key, same limiter");
+        assert_eq!(max_in_flight(a.clone()).await, 3);
+        a.lower_to(2);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(max_in_flight(a).await, 2);
+    }
+
+    #[test]
+    fn default_limit_is_the_servers() {
+        let s: super::DatalakeSettings =
+            serde_json::from_value(serde_json::json!({ "url": "http://x" })).unwrap();
+        assert_eq!(
+            s.max_concurrent_requests,
+            super::DEFAULT_MAX_CONCURRENT_REQUESTS
+        );
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
 
