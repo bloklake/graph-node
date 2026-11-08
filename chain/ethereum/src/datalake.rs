@@ -228,6 +228,41 @@ struct RecentScan {
 /// Ranges fetched ahead of the stream.
 const PREFETCH_DEPTH: BlockNumber = 5;
 
+/// The first block at or after `start` that none of `ranges` (inclusive `(first, last)`)
+/// covers: where a new range can begin without fetching a block already in flight.
+fn first_uncovered(
+    ranges: impl Iterator<Item = (BlockNumber, BlockNumber)> + Clone,
+    start: BlockNumber,
+) -> BlockNumber {
+    let mut at = start;
+    // Each pass moves past one range that holds `at`; ranges are few (`PREFETCH_DEPTH`).
+    while let Some((_, last)) = ranges
+        .clone()
+        .find(|(first, last)| *first <= at && at <= *last)
+    {
+        at = last + 1;
+    }
+    at
+}
+
+/// `to`, cut short before the first range in `ranges` that starts inside `(from, to]`, so a
+/// fetch of `[from, result]` never fetches a block that is already in flight.
+fn up_to_in_flight(
+    ranges: impl Iterator<Item = (BlockNumber, BlockNumber)>,
+    from: BlockNumber,
+    to: BlockNumber,
+) -> BlockNumber {
+    ranges
+        .filter(|(first, _)| *first > from && *first <= to)
+        .map(|(first, _)| first - 1)
+        .min()
+        .unwrap_or(to)
+}
+
+/// A page answer stops here at the latest: a range whose logs keep coming (a filter that
+/// matches most of the chain) is returned in parts rather than held in memory whole.
+const MAX_LOGS_PER_FETCH_FACTOR: u64 = 2;
+
 type Prefetched = (BlockNumber, JoinHandle<anyhow::Result<Scanned>>);
 
 /// Scans remembered for `recent_logs`.
@@ -1055,6 +1090,9 @@ impl DatalakeClient {
         let filters = Arc::new(filters);
 
         let prefetched = self.prefetched.lock().await.remove(&(key, from));
+        // The last block the prefetched range was asked for: when its answer stops short of it,
+        // the rest is fetched next, from where the answer ended.
+        let planned_end = prefetched.as_ref().map(|(end, _)| *end);
         let waited = std::time::Instant::now();
         let scanned = match prefetched {
             Some((_, handle)) => match handle.await.inspect(|_| {
@@ -1089,6 +1127,19 @@ impl DatalakeClient {
                 head
             }
             None => {
+                // Never fetch a block that a prefetch already has in flight: stop before it,
+                // and the stream's next call picks that range up.
+                let to = {
+                    let prefetched = self.prefetched.lock().await;
+                    up_to_in_flight(
+                        prefetched
+                            .iter()
+                            .filter(|((k, _), _)| *k == key)
+                            .map(|((_, start), (end, _))| (*start, *end)),
+                        from,
+                        to,
+                    )
+                };
                 debug!(logger, "Datalake range not prefetched"; "from" => from, "to" => to);
                 // Start on the next ranges now rather than after this one (at the stream's
                 // start, say): sized like this one until there is a density to go by.
@@ -1107,6 +1158,36 @@ impl DatalakeClient {
                 self.fetch(logger, from, to, &filters).await?
             }
         };
+
+        // A prefetched answer that stopped short of its range (paged): fetch the rest now, from
+        // where it ended, so the stream's next call finds it rather than fetching it again.
+        if let Some(end) = planned_end.filter(|end| scanned.to < *end) {
+            let start = scanned.to + 1;
+            let mut prefetched = self.prefetched.lock().await;
+            let free = first_uncovered(
+                prefetched
+                    .iter()
+                    .filter(|((k, _), _)| *k == key)
+                    .map(|((_, s), (e, _))| (*s, *e)),
+                start,
+            );
+            if free == start {
+                let end = up_to_in_flight(
+                    prefetched
+                        .iter()
+                        .filter(|((k, _), _)| *k == key)
+                        .map(|((_, s), (e, _))| (*s, *e)),
+                    start,
+                    end,
+                );
+                let (client, logger2, filters2) = (self.clone(), logger.clone(), filters.clone());
+                let handle =
+                    tokio::spawn(
+                        async move { client.fetch(&logger2, start, end, &filters2).await },
+                    );
+                prefetched.insert((key, start), (end, handle));
+            }
+        }
 
         let next = scanned.to + 1;
         if next <= height {
@@ -1127,7 +1208,14 @@ impl DatalakeClient {
             let mut prefetched = self.prefetched.lock().await;
             // A filter change or restarted stream leaves stale entries behind; they are few
             // and dropped here.
-            prefetched.retain(|(k, start), _| *k == key && *start >= next);
+            prefetched.retain(|(k, start), (_, handle)| {
+                let keep = *k == key && *start >= next;
+                if !keep {
+                    // Its answer will never be read: stop the request rather than pay for it.
+                    handle.abort();
+                }
+                keep
+            });
             self.plan_prefetch(logger, &mut prefetched, key, &filters, next, size, height);
         }
         self.remember(from, &scanned, filter);
@@ -1150,17 +1238,31 @@ impl DatalakeClient {
     ) {
         let mut start = next;
         for _ in 0..PREFETCH_DEPTH {
+            // Past every range of this filter already in flight, not only one that begins
+            // exactly here: a range that ended early leaves the next start in the middle of
+            // another, and fetching from there would read its blocks twice.
+            start = first_uncovered(
+                prefetched
+                    .iter()
+                    .filter(|((k, _), _)| *k == key)
+                    .map(|((_, s), (e, _))| (*s, *e)),
+                start,
+            );
             if start > height {
                 break;
-            }
-            if let Some((end, _)) = prefetched.get(&(key, start)) {
-                start = end + 1;
-                continue;
             }
             let client = self.clone();
             let logger = logger.clone();
             let filters = filters.clone();
-            let end = (start + size.max(1) - 1).min(height);
+            // Up to the next range in flight at most.
+            let end = up_to_in_flight(
+                prefetched
+                    .iter()
+                    .filter(|((k, _), _)| *k == key)
+                    .map(|((_, s), (e, _))| (*s, *e)),
+                start,
+                (start + size.max(1) - 1).min(height),
+            );
             let handle =
                 tokio::spawn(async move { client.fetch(&logger, start, end, &filters).await });
             prefetched.insert((key, start), (end, handle));
@@ -1273,31 +1375,50 @@ impl DatalakeClient {
         let mut matched = Vec::new();
         let mut covered = to;
         if !filters.is_empty() {
-            let body = serde_json::json!({
-                "fromBlock": from,
-                "toBlock": to,
-                "maxObjects": self.settings.max_objects,
-                "joinTransactions": true,
-                "logs": filters,
-                "fields": {
-                    "block": field_map(BLOCK_FIELDS),
-                    "transaction": field_map(TRANSACTION_FIELDS),
-                    "log": field_map(LOG_FIELDS),
-                },
-            });
-            let answer = self.query(logger, &body).await?;
-            covered = (answer.next_block - 1).min(to);
-            if covered < from {
-                return Err(anyhow!(
-                    "datalake answer for [{from}, {to}] does not advance (next block {})",
-                    answer.next_block
-                ));
+            // Follow the pages to the end of the range: a range answered in part would leave the
+            // stream's next start in the middle of a prefetched range, which then misses and is
+            // fetched again. Stops early only past `MAX_LOGS_PER_FETCH_FACTOR` × `target_triggers`
+            // logs (a filter that matches most of the chain), returning what it has.
+            let max_logs = self
+                .settings
+                .target_triggers
+                .saturating_mul(MAX_LOGS_PER_FETCH_FACTOR) as usize;
+            let mut cursor = from;
+            loop {
+                let body = serde_json::json!({
+                    "fromBlock": cursor,
+                    "toBlock": to,
+                    "maxObjects": self.settings.max_objects,
+                    "joinTransactions": true,
+                    "logs": filters,
+                    "fields": {
+                        "block": field_map(BLOCK_FIELDS),
+                        "transaction": field_map(TRANSACTION_FIELDS),
+                        "log": field_map(LOG_FIELDS),
+                    },
+                });
+                let answer = self.query(logger, &body).await?;
+                let page_end = (answer.next_block - 1).min(to);
+                if page_end < cursor {
+                    return Err(anyhow!(
+                        "datalake answer for [{cursor}, {to}] does not advance (next block {})",
+                        answer.next_block
+                    ));
+                }
+                let page_blocks = headers(&answer.blocks)?;
+                let hashes: BTreeMap<u64, B256> =
+                    page_blocks.iter().map(|(n, (h, _))| (*n, h.hash)).collect();
+                for (n, list) in transactions(&answer.transactions, &hashes)? {
+                    txs.entry(n).or_insert_with(Vec::new).extend(list);
+                }
+                matched.extend(logs(&answer.logs, &hashes)?);
+                blocks.extend(page_blocks);
+                covered = page_end;
+                if page_end >= to || matched.len() >= max_logs {
+                    break;
+                }
+                cursor = page_end + 1;
             }
-            blocks = headers(&answer.blocks)?;
-            let hashes: BTreeMap<u64, B256> =
-                blocks.iter().map(|(n, (h, _))| (*n, h.hash)).collect();
-            txs = transactions(&answer.transactions, &hashes)?;
-            matched = logs(&answer.logs, &hashes)?;
         }
 
         // The stream advances to the last block of the range, so it must be in the answer even
@@ -1381,6 +1502,86 @@ pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Arc<Log>]) -> HashMap<B2
 #[cfg(test)]
 mod tests {
     use graph::prelude::serde_json;
+
+    #[test]
+    fn first_uncovered_skips_every_range_in_flight() {
+        use super::first_uncovered;
+        let ranges = vec![(100, 149), (150, 199), (230, 260)];
+        // Exactly at a range start, and in the middle of one (a range that ended early).
+        assert_eq!(first_uncovered(ranges.iter().copied(), 100), 200);
+        assert_eq!(first_uncovered(ranges.iter().copied(), 120), 200);
+        assert_eq!(first_uncovered(ranges.iter().copied(), 200), 200);
+        assert_eq!(first_uncovered(ranges.iter().copied(), 240), 261);
+        assert_eq!(first_uncovered(std::iter::empty(), 7), 7);
+    }
+
+    #[test]
+    fn up_to_in_flight_stops_before_the_next_range() {
+        use super::up_to_in_flight;
+        let ranges = vec![(150, 199), (300, 399)];
+        assert_eq!(up_to_in_flight(ranges.iter().copied(), 100, 500), 149);
+        assert_eq!(up_to_in_flight(ranges.iter().copied(), 200, 500), 299);
+        assert_eq!(up_to_in_flight(ranges.iter().copied(), 200, 250), 250);
+        // A range that begins at `from` is the caller's own, not one to stop before.
+        assert_eq!(up_to_in_flight(ranges.iter().copied(), 150, 170), 170);
+    }
+
+    /// Simulates the stream against a datalake whose answers stop after 30 blocks (paged):
+    /// ranges are planned as `plan_prefetch` plans them, a short answer is continued from where
+    /// it ended, and every block must be answered exactly once.
+    #[test]
+    fn every_block_is_fetched_once_when_answers_end_early() {
+        use super::{first_uncovered, up_to_in_flight};
+        const HEIGHT: i32 = 10_000;
+        let plan = |in_flight: &mut Vec<(i32, i32)>, next: i32, size: i32| {
+            let mut start = next;
+            for _ in 0..5 {
+                start = first_uncovered(in_flight.iter().copied(), start);
+                if start > HEIGHT {
+                    break;
+                }
+                let end = up_to_in_flight(
+                    in_flight.iter().copied(),
+                    start,
+                    (start + size - 1).min(HEIGHT),
+                );
+                in_flight.push((start, end));
+                start = end + 1;
+            }
+        };
+        let mut in_flight: Vec<(i32, i32)> = Vec::new();
+        let mut answered = vec![0u32; HEIGHT as usize + 1];
+        plan(&mut in_flight, 0, 100);
+        let mut next = 0;
+        while next <= 3_000 {
+            let i = in_flight
+                .iter()
+                .position(|r| r.0 == next)
+                .expect("the stream's next start is always a range in flight");
+            let (start, end) = in_flight.remove(i);
+            // The datalake answers at most 30 blocks of the range.
+            let answered_to = (start + 29).min(end);
+            for b in start..=answered_to {
+                answered[b as usize] += 1;
+            }
+            if answered_to < end {
+                in_flight.push((answered_to + 1, end));
+            }
+            next = answered_to + 1;
+            plan(&mut in_flight, next, 100);
+            // In flight, no two ranges share a block.
+            let mut sorted = in_flight.clone();
+            sorted.sort();
+            assert!(
+                sorted.windows(2).all(|w| w[0].1 < w[1].0),
+                "overlap: {sorted:?}"
+            );
+        }
+        assert!(
+            answered[..=3_000].iter().all(|n| *n == 1),
+            "a block answered twice or never"
+        );
+    }
 
     #[test]
     fn in_flight_limit_from_429_body() {
