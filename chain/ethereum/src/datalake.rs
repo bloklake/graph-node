@@ -22,7 +22,7 @@ use arrow::array::{
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use graph::blockchain::BlockPtr;
-use graph::components::ethereum::{AnyBlock, AnyTransaction, LightEthereumBlock};
+use graph::components::ethereum::{AnyBlock, AnyTransaction, LenientHeader, LightEthereumBlock};
 use graph::prelude::alloy::consensus::{
     Signed, TxEip1559, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxEnvelope, TxLegacy,
     transaction::Recovered,
@@ -803,7 +803,7 @@ fn block(
     transactions: Vec<AnyTransaction>,
 ) -> LightEthereumBlock {
     let block: AnyBlock = Block {
-        header,
+        header: header.map(LenientHeader::from),
         uncles,
         transactions: BlockTransactions::Full(transactions),
         withdrawals: None,
