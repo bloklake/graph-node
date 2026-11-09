@@ -70,6 +70,125 @@ pub struct DatalakeSettings {
     /// reports a lower limit.
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// The `event.transaction` and `event.block` fields the mappings on this chain read, by
+    /// their graph-ts names. Only those are fetched; a field that is not listed reads as zero or
+    /// empty in the mappings. Absent: every field is fetched. An empty `transaction` list fetches
+    /// no transactions at all (each log's transaction then has only its hash and index).
+    #[serde(default)]
+    pub fields: Option<DatalakeFields>,
+}
+
+/// `fields = { transaction = [...], block = [...] }` of `[chains.<name>.datalake]`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
+pub struct DatalakeFields {
+    /// graph-ts `ethereum.Transaction` fields; absent: all of them.
+    #[serde(default)]
+    pub transaction: Option<Vec<String>>,
+    /// graph-ts `ethereum.Block` fields; absent: all of them.
+    #[serde(default)]
+    pub block: Option<Vec<String>>,
+}
+
+/// graph-ts `ethereum.Transaction` fields and the datalake fields that fill them. `hash` and
+/// `index` are always fetched (graph-node needs them to match logs to transactions).
+const TX_FIELD_MAP: &[(&str, &[&str])] = &[
+    ("hash", &[]),
+    ("index", &[]),
+    ("from", &["from"]),
+    ("to", &["to"]),
+    ("value", &["value"]),
+    ("gasLimit", &["gas"]),
+    // The effective gas price: the price fields, the type, and the block's base fee.
+    (
+        "gasPrice",
+        &["gasPrice", "maxFeePerGas", "maxPriorityFeePerGas", "type"],
+    ),
+    ("input", &["input"]),
+    ("nonce", &["nonce"]),
+];
+const TX_REQUIRED: &[&str] = &["blockNumber", "transactionIndex", "hash"];
+
+/// graph-ts `ethereum.Block` fields and the datalake fields that fill them. `hash`,
+/// `parentHash`, `number` and `timestamp` are always fetched (block pointers and ordering).
+const BLOCK_FIELD_MAP: &[(&str, &[&str])] = &[
+    ("hash", &[]),
+    ("parentHash", &[]),
+    ("number", &[]),
+    ("timestamp", &[]),
+    ("unclesHash", &["sha3Uncles"]),
+    ("author", &["miner"]),
+    ("stateRoot", &["stateRoot"]),
+    ("transactionsRoot", &["transactionsRoot"]),
+    ("receiptsRoot", &["receiptsRoot"]),
+    ("gasUsed", &["gasUsed"]),
+    ("gasLimit", &["gasLimit"]),
+    ("difficulty", &["difficulty"]),
+    ("totalDifficulty", &["totalDifficulty"]),
+    ("size", &["size"]),
+    ("baseFeePerGas", &["baseFeePerGas"]),
+];
+const BLOCK_REQUIRED: &[&str] = &["number", "hash", "parentHash", "timestamp"];
+
+/// The fields requested from the datalake, resolved once from `DatalakeSettings::fields`.
+#[derive(Clone, Debug, PartialEq)]
+struct Selection {
+    block: serde_json::Value,
+    /// `None`: no transactions are joined (none of their fields were asked for).
+    transaction: Option<serde_json::Value>,
+}
+
+/// The datalake fields for the graph-ts names in `wanted`, or an error naming the valid ones.
+fn mapped<'a>(
+    kind: &str,
+    map: &[(&str, &'a [&'a str])],
+    wanted: &[String],
+) -> anyhow::Result<Vec<&'a str>> {
+    let mut out = Vec::new();
+    for name in wanted {
+        let Some((_, fields)) = map.iter().find(|(n, _)| n == name) else {
+            let valid: Vec<&str> = map.iter().map(|(n, _)| *n).collect();
+            return Err(anyhow!(
+                "datalake fields: unknown {kind} field `{name}`; valid: {}",
+                valid.join(", ")
+            ));
+        };
+        out.extend(fields.iter().copied());
+    }
+    Ok(out)
+}
+
+fn select(fields: Option<&DatalakeFields>) -> anyhow::Result<Selection> {
+    let fields = fields.cloned().unwrap_or_default();
+    let mut block: Vec<&str> = match &fields.block {
+        None => BLOCK_FIELDS.to_vec(),
+        Some(list) => BLOCK_REQUIRED
+            .iter()
+            .copied()
+            .chain(mapped("block", BLOCK_FIELD_MAP, list)?)
+            .collect(),
+    };
+    let transaction = match &fields.transaction {
+        None => Some(TRANSACTION_FIELDS.to_vec()),
+        Some(list) => {
+            let extra = mapped("transaction", TX_FIELD_MAP, list)?;
+            if extra.is_empty() && !list.iter().any(|n| n == "hash" || n == "index") {
+                None
+            } else {
+                Some(TX_REQUIRED.iter().copied().chain(extra).collect::<Vec<_>>())
+            }
+        }
+    };
+    if transaction
+        .as_ref()
+        .is_some_and(|t| t.contains(&"maxFeePerGas"))
+        && !block.contains(&"baseFeePerGas")
+    {
+        block.push("baseFeePerGas");
+    }
+    Ok(Selection {
+        block: field_map(&block),
+        transaction: transaction.map(|t| field_map(&t)),
+    })
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -216,6 +335,8 @@ pub struct DatalakeClient {
     recent: std::sync::Mutex<std::collections::VecDeque<RecentScan>>,
     /// Whether the chain's missing fields (`bl.unavailable_fields`) were logged already.
     warned_unavailable: std::sync::atomic::AtomicBool,
+    /// The fields requested (`DatalakeSettings::fields`).
+    selection: Selection,
 }
 
 struct RecentScan {
@@ -306,7 +427,9 @@ impl DatalakeClient {
             .timeout(Duration::from_secs(settings.timeout_secs))
             .pool_max_idle_per_host(16)
             .build()?;
+        let selection = select(settings.fields.as_ref())?;
         Ok(Self {
+            selection,
             limiter: Limiter::for_settings(&settings),
             settings,
             http,
@@ -714,21 +837,21 @@ fn headers(
         let parent = c.fixed("parent_hash")?;
         let timestamp = c.u64("timestamp")?;
         let size = c.opt::<UInt64Array>("size");
-        let gas_used = c.u64("gas_used")?;
-        let gas_limit = c.u64("gas_limit")?;
+        let gas_used = c.opt::<UInt64Array>("gas_used");
+        let gas_limit = c.opt::<UInt64Array>("gas_limit");
         let base_fee = c.opt::<FixedSizeBinaryArray>("base_fee_per_gas");
-        let state_root = c.fixed("state_root")?;
-        let tx_root = c.fixed("transactions_root")?;
-        let receipts_root = c.fixed("receipts_root")?;
-        let bloom = c.fixed("logs_bloom")?;
+        let state_root = c.opt::<FixedSizeBinaryArray>("state_root");
+        let tx_root = c.opt::<FixedSizeBinaryArray>("transactions_root");
+        let receipts_root = c.opt::<FixedSizeBinaryArray>("receipts_root");
+        let bloom = c.opt::<FixedSizeBinaryArray>("logs_bloom");
         let difficulty = c.opt::<FixedSizeBinaryArray>("difficulty");
         let total_difficulty = c.opt::<FixedSizeBinaryArray>("total_difficulty");
-        let miner = c.fixed("miner")?;
+        let miner = c.opt::<FixedSizeBinaryArray>("miner");
         let nonce = c.opt::<FixedSizeBinaryArray>("nonce");
-        let uncles_hash = c.fixed("sha3_uncles")?;
+        let uncles_hash = c.opt::<FixedSizeBinaryArray>("sha3_uncles");
         let uncles = c.opt::<ListArray>("uncles");
         let mix_hash = c.opt::<FixedSizeBinaryArray>("mix_hash");
-        let extra = c.binary("extra_data")?;
+        let extra = c.opt::<BinaryArray>("extra_data");
         let withdrawals_root = c.opt::<FixedSizeBinaryArray>("withdrawals_root");
         let blob_gas_used = c.opt::<UInt64Array>("blob_gas_used");
         let excess_blob_gas = c.opt::<UInt64Array>("excess_blob_gas");
@@ -737,18 +860,22 @@ fn headers(
         for i in 0..batch.num_rows() {
             let inner = AnyHeader {
                 parent_hash: b256(parent, i),
-                ommers_hash: b256(uncles_hash, i),
-                beneficiary: address(miner, i),
-                state_root: b256(state_root, i),
-                transactions_root: b256(tx_root, i),
-                receipts_root: b256(receipts_root, i),
-                logs_bloom: Bloom::from_slice(bloom.value(i)),
+                ommers_hash: opt_b256(uncles_hash, i).unwrap_or_default(),
+                beneficiary: opt_address(miner, i).unwrap_or_default(),
+                state_root: opt_b256(state_root, i).unwrap_or_default(),
+                transactions_root: opt_b256(tx_root, i).unwrap_or_default(),
+                receipts_root: opt_b256(receipts_root, i).unwrap_or_default(),
+                logs_bloom: bloom
+                    .filter(|a| !a.is_null(i))
+                    .map_or_else(Bloom::default, |a| Bloom::from_slice(a.value(i))),
                 difficulty: U256::from(opt_u128(difficulty, i).unwrap_or(0)),
                 number: number.value(i),
-                gas_limit: gas_limit.value(i),
-                gas_used: gas_used.value(i),
+                gas_limit: opt_u64(gas_limit, i).unwrap_or(0),
+                gas_used: opt_u64(gas_used, i).unwrap_or(0),
                 timestamp: timestamp.value(i),
-                extra_data: Bytes::copy_from_slice(extra.value(i)),
+                extra_data: extra
+                    .filter(|a| !a.is_null(i))
+                    .map_or_else(Bytes::new, |a| Bytes::copy_from_slice(a.value(i))),
                 mix_hash: opt_b256(mix_hash, i),
                 nonce: nonce
                     .filter(|a| !a.is_null(i))
@@ -792,16 +919,16 @@ fn transactions(
         let block = c.u64("block_number")?;
         let index = c.get::<UInt32Array>("transaction_index")?;
         let hash = c.fixed("hash")?;
-        let from = c.fixed("from")?;
+        let from = c.opt::<FixedSizeBinaryArray>("from");
         let to = c.opt::<FixedSizeBinaryArray>("to");
         let value = c.opt::<FixedSizeBinaryArray>("value");
-        let input = c.binary("input")?;
-        let nonce = c.u64("nonce")?;
-        let gas = c.u64("gas")?;
+        let input = c.opt::<BinaryArray>("input");
+        let nonce = c.opt::<UInt64Array>("nonce");
+        let gas = c.opt::<UInt64Array>("gas");
         let gas_price = c.opt::<FixedSizeBinaryArray>("gas_price");
         let max_fee = c.opt::<FixedSizeBinaryArray>("max_fee_per_gas");
         let max_priority = c.opt::<FixedSizeBinaryArray>("max_priority_fee_per_gas");
-        let ty = c.get::<UInt8Array>("type")?;
+        let ty = c.opt::<UInt8Array>("type");
         let access = c.opt::<ListArray>("access_list");
         let chain_id = c.opt::<UInt64Array>("chain_id");
         // Not requested (see TRANSACTION_FIELDS); read when present, else a placeholder.
@@ -820,9 +947,11 @@ fn transactions(
             let to = opt_address(to, i);
             let kind = to.map_or(TxKind::Create, TxKind::Call);
             let value = U256::from(opt_u128(value, i).unwrap_or(0));
-            let input = Bytes::copy_from_slice(input.value(i));
-            let nonce = nonce.value(i);
-            let gas_limit = gas.value(i);
+            let input = input
+                .filter(|a| !a.is_null(i))
+                .map_or_else(Bytes::new, |a| Bytes::copy_from_slice(a.value(i)));
+            let nonce = opt_u64(nonce, i).unwrap_or(0);
+            let gas_limit = opt_u64(gas, i).unwrap_or(0);
             let chain_id = opt_u64(chain_id, i);
             let y = y_parity.filter(|a| !a.is_null(i)).map(|a| a.value(i));
             let signature = Signature::new(
@@ -834,7 +963,7 @@ fn transactions(
             );
             let max_fee_per_gas = opt_u128(max_fee, i).unwrap_or(0);
             let max_priority_fee_per_gas = opt_u128(max_priority, i).unwrap_or(0);
-            let envelope = match ty.value(i) {
+            let envelope = match ty.filter(|a| !a.is_null(i)).map_or(0, |a| a.value(i)) {
                 0 => TxEnvelope::Legacy(Signed::new_unchecked(
                     TxLegacy {
                         chain_id: chain_id.or_else(|| {
@@ -921,7 +1050,7 @@ fn transactions(
             let tx = AnyTransaction {
                 inner: Recovered::new_unchecked(
                     AnyTxEnvelope::Ethereum(envelope),
-                    address(from, i),
+                    opt_address(from, i).unwrap_or_default(),
                 ),
                 block_hash: Some(block_hash),
                 block_number: Some(number),
@@ -933,6 +1062,39 @@ fn transactions(
         }
     }
     Ok(out)
+}
+
+/// One transaction per distinct transaction of `logs`, with only what the log says about it
+/// (hash, index, block): used when no transaction fields are requested. Every other field is
+/// zero or empty.
+fn placeholder_transactions(logs: &[Log]) -> Vec<(u64, AnyTransaction)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for log in logs {
+        let (Some(hash), Some(number)) = (log.transaction_hash, log.block_number) else {
+            continue;
+        };
+        if !seen.insert(hash) {
+            continue;
+        }
+        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::new(U256::ZERO, U256::ZERO, false),
+            hash,
+        ));
+        out.push((
+            number,
+            AnyTransaction {
+                inner: Recovered::new_unchecked(AnyTxEnvelope::Ethereum(envelope), Address::ZERO),
+                block_hash: log.block_hash,
+                block_number: Some(number),
+                transaction_index: log.transaction_index,
+                effective_gas_price: None,
+                block_timestamp: None,
+            },
+        ));
+    }
+    out
 }
 
 fn logs(batches: &[RecordBatch], block_hashes: &BTreeMap<u64, B256>) -> anyhow::Result<Vec<Log>> {
@@ -1356,7 +1518,7 @@ impl DatalakeClient {
         let body = serde_json::json!({
             "fromBlock": number,
             "toBlock": number,
-            "fields": { "block": field_map(BLOCK_FIELDS) },
+            "fields": { "block": self.selection.block.clone() },
         });
         headers(&self.query(logger, &body).await?.blocks)
     }
@@ -1385,18 +1547,20 @@ impl DatalakeClient {
                 .saturating_mul(MAX_LOGS_PER_FETCH_FACTOR) as usize;
             let mut cursor = from;
             loop {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "fromBlock": cursor,
                     "toBlock": to,
                     "maxObjects": self.settings.max_objects,
-                    "joinTransactions": true,
                     "logs": filters,
                     "fields": {
-                        "block": field_map(BLOCK_FIELDS),
-                        "transaction": field_map(TRANSACTION_FIELDS),
+                        "block": self.selection.block.clone(),
                         "log": field_map(LOG_FIELDS),
                     },
                 });
+                if let Some(transaction) = &self.selection.transaction {
+                    body["joinTransactions"] = true.into();
+                    body["fields"]["transaction"] = transaction.clone();
+                }
                 let answer = self.query(logger, &body).await?;
                 let page_end = (answer.next_block - 1).min(to);
                 if page_end < cursor {
@@ -1411,7 +1575,14 @@ impl DatalakeClient {
                 for (n, list) in transactions(&answer.transactions, &hashes)? {
                     txs.entry(n).or_insert_with(Vec::new).extend(list);
                 }
-                matched.extend(logs(&answer.logs, &hashes)?);
+                let page_logs = logs(&answer.logs, &hashes)?;
+                if self.selection.transaction.is_none() {
+                    // No transaction fields asked for: each log's transaction from the log alone.
+                    for (n, tx) in placeholder_transactions(&page_logs) {
+                        txs.entry(n).or_insert_with(Vec::new).push(tx);
+                    }
+                }
+                matched.extend(page_logs);
                 blocks.extend(page_blocks);
                 covered = page_end;
                 if page_end >= to || matched.len() >= max_logs {
@@ -1502,6 +1673,58 @@ pub fn receipts_needed(filter: &TriggerFilter, logs: &[&Arc<Log>]) -> HashMap<B2
 #[cfg(test)]
 mod tests {
     use graph::prelude::serde_json;
+
+    #[test]
+    fn field_selection() {
+        use super::{DatalakeFields, select};
+        let f = |tx: Option<Vec<&str>>, block: Option<Vec<&str>>| DatalakeFields {
+            transaction: tx.map(|v| v.into_iter().map(String::from).collect()),
+            block: block.map(|v| v.into_iter().map(String::from).collect()),
+        };
+        // No `fields`: everything, transactions joined.
+        let all = select(None).unwrap();
+        assert!(all.transaction.unwrap().get("input").is_some());
+        assert!(all.block.get("logsBloom").is_some());
+        // An empty transaction list: no transactions at all; only the required block fields.
+        let none = select(Some(&f(Some(vec![]), Some(vec![])))).unwrap();
+        assert!(none.transaction.is_none());
+        let keys: Vec<&String> = none.block.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        // `from` and `gasPrice`: their fields plus the required ones, and the base fee.
+        let some = select(Some(&f(
+            Some(vec!["from", "gasPrice"]),
+            Some(vec!["timestamp"]),
+        )))
+        .unwrap();
+        let tx = some.transaction.unwrap();
+        for k in [
+            "hash",
+            "transactionIndex",
+            "blockNumber",
+            "from",
+            "gasPrice",
+            "maxFeePerGas",
+            "type",
+        ] {
+            assert!(tx.get(k).is_some(), "{k}");
+        }
+        assert!(tx.get("input").is_none());
+        assert!(some.block.get("baseFeePerGas").is_some());
+        // Unknown names are rejected with the valid ones.
+        let err = select(Some(&f(Some(vec!["gas"]), None)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown transaction field `gas`") && err.contains("gasLimit"),
+            "{err}"
+        );
+        // Settings parse from TOML-shaped JSON.
+        let s: super::DatalakeSettings = serde_json::from_value(serde_json::json!({
+            "url": "http://x", "fields": { "transaction": [], "block": ["timestamp"] }
+        }))
+        .unwrap();
+        assert_eq!(s.fields.unwrap().transaction, Some(vec![]));
+    }
 
     #[test]
     fn first_uncovered_skips_every_range_in_flight() {

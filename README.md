@@ -20,7 +20,25 @@ datalake = { url = "https://eth.api.bloklake.com", api_key = "bl_live_..." }  # 
 ```
 
 JSON-RPC is still used for the chain head, blocks after the API's archive height, call and block
-handlers, and receipts when a handler asks for them. Requests stay under the API key's in-flight
+handlers, and receipts when a handler asks for them.
+
+**Fetch only the fields your mappings read.** By default the fork fetches every
+`event.transaction` and `event.block` field. List the ones your mappings actually read (graph-ts
+names) and only those are fetched, which can cut a backfill's data, and its cost, severalfold:
+
+```toml
+datalake = { url = "https://eth.api.bloklake.com", api_key = "bl_live_...",
+             fields = { transaction = ["hash", "from"], block = ["timestamp"] } }
+```
+
+- `transaction`: `hash`, `index`, `from`, `to`, `value`, `gasLimit`, `gasPrice`, `input`, `nonce`.
+  An empty list (`transaction = []`) fetches no transactions at all; each log's transaction then
+  has only its hash and index.
+- `block`: `hash`, `parentHash`, `number`, `timestamp` (always fetched), `unclesHash`, `author`,
+  `stateRoot`, `transactionsRoot`, `receiptsRoot`, `gasUsed`, `gasLimit`, `difficulty`,
+  `totalDifficulty`, `size`, `baseFeePerGas`.
+- A field that is not listed reads as zero or empty in the mappings, so list every field they
+  read. The setting applies to every subgraph the node indexes on that chain. Requests stay under the API key's in-flight
 limit (`max_concurrent_requests`, default 4); a `429` waits for `Retry-After` and is not counted
 as a failure.
 
