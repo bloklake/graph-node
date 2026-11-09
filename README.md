@@ -38,9 +38,13 @@ datalake = { url = "https://eth.api.bloklake.com", api_key = "bl_live_...",
   `stateRoot`, `transactionsRoot`, `receiptsRoot`, `gasUsed`, `gasLimit`, `difficulty`,
   `totalDifficulty`, `size`, `baseFeePerGas`.
 - A field that is not listed reads as zero or empty in the mappings, so list every field they
-  read. The setting applies to every subgraph the node indexes on that chain. Requests stay under the API key's in-flight
-limit (`max_concurrent_requests`, default 4); a `429` waits for `Retry-After` and is not counted
-as a failure.
+  read. The setting applies to every subgraph the node indexes on that chain.
+
+Requests stay under the API key's in-flight limit (`max_concurrent_requests`, default 4), with
+one request kept free for the range the indexer is waiting on; a `429` waits for `Retry-After`
+and is not counted as a failure. Ranges are fetched ahead of indexing: at most
+`GRAPH_DATALAKE_PREFETCH_DEPTH` ranges (default 5) and `max_prefetch_bytes` of decoded data
+(default 256 MiB), so memory stays flat however far the backfill goes.
 
 ### Benchmark
 

@@ -76,6 +76,16 @@ pub struct DatalakeSettings {
     /// no transactions at all (each log's transaction then has only its hash and index).
     #[serde(default)]
     pub fields: Option<DatalakeFields>,
+    /// Bytes held by ranges fetched ahead of the stream, at most (default 256 MiB): their
+    /// decoded blocks, transactions and logs (estimated), or the answers' size on the wire when
+    /// larger. Ranges ahead are sized from the bytes per block seen so far, so a dense filter
+    /// is read ahead in shorter ranges instead of holding gigabytes.
+    #[serde(default = "default_max_prefetch_bytes")]
+    pub max_prefetch_bytes: u64,
+}
+
+fn default_max_prefetch_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 /// `fields = { transaction = [...], block = [...] }` of `[chains.<name>.datalake]`.
@@ -203,9 +213,30 @@ const THROTTLE_BUDGET: Duration = Duration::from_secs(300);
 
 /// Requests in flight for one API key (one URL without a key). The server counts a key's
 /// requests across all of its chains, so every client using the key shares the permits.
+///
+/// Prefetches (ranges ahead of the block stream) also take one of `prefetch` permits, one fewer
+/// than the limit: a request the stream is waiting on always finds a permit free or next in
+/// line, instead of queueing behind ranges it needs later.
 struct Limiter {
     permits: Arc<Semaphore>,
+    prefetch: Arc<Semaphore>,
     max: AtomicUsize,
+}
+
+tokio::task_local! {
+    /// Set in prefetch tasks: their requests take a prefetch permit too.
+    static IS_PREFETCH: ();
+}
+
+/// Permits held for one request.
+struct Permit {
+    _request: OwnedSemaphorePermit,
+    _prefetch: Option<OwnedSemaphorePermit>,
+}
+
+/// Prefetch permits for a request limit: one fewer, at least one.
+fn prefetch_permits(max: usize) -> usize {
+    max.saturating_sub(1).max(1)
 }
 
 impl Limiter {
@@ -223,6 +254,7 @@ impl Limiter {
             .or_insert_with(|| {
                 Arc::new(Limiter {
                     permits: Arc::new(Semaphore::new(max)),
+                    prefetch: Arc::new(Semaphore::new(prefetch_permits(max))),
                     max: AtomicUsize::new(max),
                 })
             })
@@ -231,12 +263,29 @@ impl Limiter {
         limiter
     }
 
-    async fn acquire(&self) -> OwnedSemaphorePermit {
-        self.permits
+    /// A permit for one request; in a prefetch task, a prefetch permit first.
+    async fn acquire(&self) -> Permit {
+        let prefetch = if IS_PREFETCH.try_with(|_| ()).is_ok() {
+            Some(
+                self.prefetch
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("the datalake limiter is never closed"),
+            )
+        } else {
+            None
+        };
+        let request = self
+            .permits
             .clone()
             .acquire_owned()
             .await
-            .expect("the datalake limiter is never closed")
+            .expect("the datalake limiter is never closed");
+        Permit {
+            _request: request,
+            _prefetch: prefetch,
+        }
     }
 
     /// Lowers the limit; permits in use are taken out of circulation as they come back.
@@ -244,21 +293,31 @@ impl Limiter {
         let limit = limit.max(1);
         let old = self.max.fetch_min(limit, Ordering::Relaxed);
         if limit < old {
-            let permits = self.permits.clone();
-            let n = (old - limit) as u32;
-            let take = async move {
-                if let Ok(p) = permits.acquire_many_owned(n).await {
-                    p.forget();
-                }
-            };
-            match tokio::runtime::Handle::try_current() {
-                Ok(rt) => {
-                    rt.spawn(take);
-                }
-                Err(_) => {
-                    let forgotten = self.permits.forget_permits(n as usize);
-                    debug_assert!(forgotten <= n as usize);
-                }
+            Self::take(&self.permits, old - limit);
+            Self::take(
+                &self.prefetch,
+                prefetch_permits(old) - prefetch_permits(limit),
+            );
+        }
+    }
+
+    /// Takes `n` permits out of circulation (once they are free).
+    fn take(permits: &Arc<Semaphore>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let permits = permits.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    if let Ok(p) = permits.acquire_many_owned(n as u32).await {
+                        p.forget();
+                    }
+                });
+            }
+            Err(_) => {
+                let forgotten = permits.forget_permits(n);
+                debug_assert!(forgotten <= n);
             }
         }
     }
@@ -346,8 +405,14 @@ struct RecentScan {
     logs: HashMap<u64, Vec<Arc<Log>>>,
 }
 
-/// Ranges fetched ahead of the stream.
-const PREFETCH_DEPTH: BlockNumber = 5;
+/// Ranges fetched ahead of the block stream (`GRAPH_DATALAKE_PREFETCH_DEPTH`, default 5).
+static PREFETCH_DEPTH: LazyLock<BlockNumber> = LazyLock::new(|| {
+    std::env::var("GRAPH_DATALAKE_PREFETCH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &BlockNumber| *v >= 0)
+        .unwrap_or(5)
+});
 
 /// The first block at or after `start` that none of `ranges` (inclusive `(first, last)`)
 /// covers: where a new range can begin without fetching a block already in flight.
@@ -384,10 +449,16 @@ fn up_to_in_flight(
 /// matches most of the chain) is returned in parts rather than held in memory whole.
 const MAX_LOGS_PER_FETCH_FACTOR: u64 = 2;
 
+/// A range fetched ahead of the stream: its last block, and the fetch.
 type Prefetched = (BlockNumber, JoinHandle<anyhow::Result<Scanned>>);
 
-/// Scans remembered for `recent_logs`.
-const RECENT_SCANS: usize = 8;
+/// Scans kept for `recent_logs` (`GRAPH_DATALAKE_RECENT_SCANS`, default 8).
+static RECENT_SCANS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("GRAPH_DATALAKE_RECENT_SCANS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+});
 
 impl std::fmt::Debug for DatalakeClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -419,6 +490,8 @@ struct Answer {
     next_block: BlockNumber,
     /// `bl.unavailable_fields`: selected fields the chain doesn't have (their columns are null).
     unavailable_fields: Vec<String>,
+    /// Size of the answer's body.
+    bytes: usize,
 }
 
 impl DatalakeClient {
@@ -519,7 +592,10 @@ impl DatalakeClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("datalake answered {status}: {text}"));
         }
-        decode_answer(&resp.bytes().await?)
+        let body = resp.bytes().await?;
+        let mut answer = decode_answer(&body)?;
+        answer.bytes = body.len();
+        Ok(answer)
     }
 
     async fn query(&self, logger: &Logger, body: &serde_json::Value) -> anyhow::Result<Answer> {
@@ -1151,6 +1227,20 @@ fn block(
     LightEthereumBlock::new(block)
 }
 
+/// Estimated heap bytes a range holds once decoded: its blocks (header and the block that wraps
+/// it), transactions and logs (with their data and topics).
+fn held_bytes(blocks: usize, transactions: usize, logs: &[Log]) -> usize {
+    const BLOCK: usize = std::mem::size_of::<LightEthereumBlock>() + 1_024;
+    const TRANSACTION: usize = std::mem::size_of::<AnyTransaction>() + 64;
+    let logs: usize = logs
+        .iter()
+        .map(|log| {
+            std::mem::size_of::<Log>() + 32 + log.data().data.len() + 32 * log.topics().len()
+        })
+        .sum();
+    blocks * BLOCK + transactions * TRANSACTION + logs
+}
+
 /// Identifies a set of filter objects, to match prefetched answers to later scans.
 fn fingerprint(filters: &[serde_json::Value]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1167,6 +1257,8 @@ pub struct Scanned {
     pub blocks: Vec<(Arc<LightEthereumBlock>, Vec<Arc<Log>>)>,
     /// Last block the scan covers.
     pub to: BlockNumber,
+    /// Bytes the range holds: decoded, or on the wire if larger (for sizing ranges ahead).
+    pub bytes: usize,
 }
 
 /// The `/query` filter objects for a log filter, or `None` when the datalake cannot express it.
@@ -1363,10 +1455,20 @@ impl DatalakeClient {
                 let per_block = logs as f64 / scanned_size as f64;
                 (self.settings.target_triggers as f64 / per_block).max(1.0) as BlockNumber
             };
+            // And at most an even share of `max_prefetch_bytes` at the bytes per block just seen.
+            let by_bytes = if scanned.bytes == 0 {
+                BlockNumber::MAX
+            } else {
+                let per_block = scanned.bytes as f64 / scanned_size as f64;
+                let share =
+                    self.settings.max_prefetch_bytes as f64 / (*PREFETCH_DEPTH).max(1) as f64;
+                (share / per_block).max(1.0) as BlockNumber
+            };
             let size = scanned_size
                 .saturating_mul(10)
                 .min(self.settings.max_block_range)
-                .min(by_density);
+                .min(by_density)
+                .min(by_bytes);
             let mut prefetched = self.prefetched.lock().await;
             // A filter change or restarted stream leaves stale entries behind; they are few
             // and dropped here.
@@ -1399,7 +1501,14 @@ impl DatalakeClient {
         height: BlockNumber,
     ) {
         let mut start = next;
-        for _ in 0..PREFETCH_DEPTH {
+        // Note: `PREFETCH_DEPTH` is the most ranges ahead of the stream, counting those already
+        // in flight: adding that many on every scan would let them pile up whenever fetching
+        // outpaces indexing (each scan consumes one), holding ever more blocks in memory.
+        let ahead = prefetched
+            .iter()
+            .filter(|((k, s), _)| *k == key && *s >= next)
+            .count() as BlockNumber;
+        for _ in ahead..*PREFETCH_DEPTH {
             // Past every range of this filter already in flight, not only one that begins
             // exactly here: a range that ended early leaves the next start in the middle of
             // another, and fetching from there would read its blocks twice.
@@ -1425,8 +1534,9 @@ impl DatalakeClient {
                 start,
                 (start + size.max(1) - 1).min(height),
             );
-            let handle =
-                tokio::spawn(async move { client.fetch(&logger, start, end, &filters).await });
+            let handle = tokio::spawn(IS_PREFETCH.scope((), async move {
+                client.fetch(&logger, start, end, &filters).await
+            }));
             prefetched.insert((key, start), (end, handle));
             start = end + 1;
         }
@@ -1446,7 +1556,7 @@ impl DatalakeClient {
             filter: filter.log.clone(),
             logs,
         });
-        while recent.len() > RECENT_SCANS {
+        while recent.len() > *RECENT_SCANS {
             recent.pop_front();
         }
     }
@@ -1493,10 +1603,21 @@ impl DatalakeClient {
             .blocks
             .partition_point(|(block, _)| block.number_u64() <= last);
         let rest_blocks = scanned.blocks.split_off(at);
+        let span = (scanned.to
+            - scanned
+                .blocks
+                .first()
+                .map_or(to, |(b, _)| b.number_u64() as BlockNumber)
+            + 1)
+        .max(1);
+        let rest_share = (scanned.to - to).max(0) as f64 / span as f64;
+        let rest_bytes = (scanned.bytes as f64 * rest_share) as usize;
         let rest = (!rest_blocks.is_empty()).then(|| Scanned {
             blocks: rest_blocks,
             to: scanned.to,
+            bytes: rest_bytes,
         });
+        scanned.bytes -= rest_bytes.min(scanned.bytes);
         if scanned.blocks.last().map(|(b, _)| b.number_u64()) != Some(last) {
             let mut headers = self.header(logger, to).await?;
             let (header, uncles) = headers
@@ -1536,6 +1657,7 @@ impl DatalakeClient {
         let mut txs = HashMap::new();
         let mut matched = Vec::new();
         let mut covered = to;
+        let mut fetched_bytes = 0usize;
         if !filters.is_empty() {
             // Follow the pages to the end of the range: a range answered in part would leave the
             // stream's next start in the middle of a prefetched range, which then misses and is
@@ -1545,6 +1667,8 @@ impl DatalakeClient {
                 .settings
                 .target_triggers
                 .saturating_mul(MAX_LOGS_PER_FETCH_FACTOR) as usize;
+            let max_bytes =
+                (self.settings.max_prefetch_bytes / (*PREFETCH_DEPTH).max(1) as u64) as usize;
             let mut cursor = from;
             loop {
                 let mut body = serde_json::json!({
@@ -1576,16 +1700,30 @@ impl DatalakeClient {
                     txs.entry(n).or_insert_with(Vec::new).extend(list);
                 }
                 let page_logs = logs(&answer.logs, &hashes)?;
+                let mut page_txs = answer
+                    .transactions
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>();
                 if self.selection.transaction.is_none() {
                     // No transaction fields asked for: each log's transaction from the log alone.
                     for (n, tx) in placeholder_transactions(&page_logs) {
                         txs.entry(n).or_insert_with(Vec::new).push(tx);
+                        page_txs += 1;
                     }
                 }
+                // Note: The budget is what the range holds once decoded, not its size on the
+                // wire: with few fields selected the answers shrink several times, the decoded
+                // blocks, transactions and logs do not.
+                fetched_bytes +=
+                    answer
+                        .bytes
+                        .max(held_bytes(page_blocks.len(), page_txs, &page_logs));
                 matched.extend(page_logs);
                 blocks.extend(page_blocks);
                 covered = page_end;
-                if page_end >= to || matched.len() >= max_logs {
+                if page_end >= to || matched.len() >= max_logs || fetched_bytes >= max_bytes.max(1)
+                {
                     break;
                 }
                 cursor = page_end + 1;
@@ -1623,6 +1761,7 @@ impl DatalakeClient {
         Ok(Scanned {
             blocks,
             to: covered,
+            bytes: fetched_bytes,
         })
     }
 
@@ -1835,6 +1974,44 @@ mod tests {
             t.await.unwrap();
         }
         max.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn prefetches_leave_a_permit_for_the_stream() {
+        let settings: super::DatalakeSettings = serde_json::from_value(serde_json::json!({
+            "url": "http://prefetch-permits.test", "api_key": "test-prefetch-key",
+            "max_concurrent_requests": 3
+        }))
+        .unwrap();
+        let limiter = super::Limiter::for_settings(&settings);
+        // Prefetches hold every permit they may take (two of three) ...
+        let mut held = Vec::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for _ in 0..4 {
+            let (limiter, tx) = (limiter.clone(), tx.clone());
+            held.push(tokio::spawn(super::IS_PREFETCH.scope((), async move {
+                let permit = limiter.acquire().await;
+                tx.send(()).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(permit);
+            })));
+        }
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        // ... and the stream still gets one at once.
+        let got =
+            tokio::time::timeout(std::time::Duration::from_millis(50), limiter.acquire()).await;
+        assert!(got.is_ok(), "the stream waited behind prefetches");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "a third prefetch got a permit"
+        );
+        drop(got);
+        for h in held {
+            h.await.unwrap();
+        }
     }
 
     #[tokio::test]
